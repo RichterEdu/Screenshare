@@ -1,6 +1,6 @@
-# HELLO v1 — 2400x1080, 420 dpi, H.264 + H.265
+# HELLO v2 — 2400x1080, 420 dpi, H.264 + H.265
 01 09 00 00 00   # type=HELLO, length=9
-01 00            # protocolVersion=1
+02 00            # protocolVersion=2
 60 09            # width=2400
 38 04            # height=1080
 A4 01            # densityDpi=420

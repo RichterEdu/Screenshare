@@ -42,7 +42,7 @@ public class HostServerTests : IAsyncLifetime
         var (client, stream, reader) = await ConnectAsync();
         using var _ = client;
 
-        await SendAsync(stream, new HelloMessage(1, 2400, 1080, 420, VideoCodec.H264 | VideoCodec.H265));
+        await SendAsync(stream, new HelloMessage(MessageCodec.ProtocolVersion, 2400, 1080, 420, VideoCodec.H264 | VideoCodec.H265));
 
         var config = Assert.IsType<ConfigMessage>(await reader.ReadAsync(_cts.Token));
         Assert.Equal(2400, config.Width);
@@ -55,7 +55,7 @@ public class HostServerTests : IAsyncLifetime
     {
         var (client, stream, reader) = await ConnectAsync();
         using var _ = client;
-        await SendAsync(stream, new HelloMessage(1, 2400, 1080, 420, VideoCodec.H264));
+        await SendAsync(stream, new HelloMessage(MessageCodec.ProtocolVersion, 2400, 1080, 420, VideoCodec.H264));
         Assert.IsType<ConfigMessage>(await reader.ReadAsync(_cts.Token));
 
         await SendAsync(stream, new PingMessage(123456789));
@@ -69,7 +69,7 @@ public class HostServerTests : IAsyncLifetime
         var (client, stream, reader) = await ConnectAsync();
         using var _ = client;
 
-        await SendAsync(stream, new HelloMessage(2, 2400, 1080, 420, VideoCodec.H264));
+        await SendAsync(stream, new HelloMessage(1, 2400, 1080, 420, VideoCodec.H264));
 
         Assert.Null(await reader.ReadAsync(_cts.Token));
     }
@@ -78,13 +78,13 @@ public class HostServerTests : IAsyncLifetime
     public async Task Server_accepts_a_new_client_after_the_previous_one_disconnects()
     {
         var first = await ConnectAsync();
-        await SendAsync(first.Stream, new HelloMessage(1, 2400, 1080, 420, VideoCodec.H264));
+        await SendAsync(first.Stream, new HelloMessage(MessageCodec.ProtocolVersion, 2400, 1080, 420, VideoCodec.H264));
         Assert.IsType<ConfigMessage>(await first.Reader.ReadAsync(_cts.Token));
         first.Client.Dispose();
 
         var (client, stream, reader) = await ConnectAsync();
         using var _ = client;
-        await SendAsync(stream, new HelloMessage(1, 1920, 1080, 320, VideoCodec.H264));
+        await SendAsync(stream, new HelloMessage(MessageCodec.ProtocolVersion, 1920, 1080, 320, VideoCodec.H264));
 
         Assert.IsType<ConfigMessage>(await reader.ReadAsync(_cts.Token));
     }

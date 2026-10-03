@@ -1,0 +1,3 @@
+# DENIED — aparelho não pareado
+0B 01 00 00 00   # type=DENIED, length=1
+02               # reason=2 (aparelho não pareado ou removido)

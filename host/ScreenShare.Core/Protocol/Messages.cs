@@ -10,6 +10,10 @@ public enum MessageType : byte
     Ping = 5,
     Pong = 6,
     KeyframeRequest = 7,
+    Pair = 8,
+    Paired = 9,
+    Auth = 10,
+    Denied = 11,
 }
 
 /// <summary>Flags de codec: o HELLO carrega uma combinação; o CONFIG, exatamente um.</summary>
@@ -55,3 +59,26 @@ public sealed record PongMessage(ulong TimestampUs) : Message;
 
 /// <summary>Celular → PC: pede um keyframe após erro de decodificação.</summary>
 public sealed record KeyframeRequestMessage : Message;
+
+/// <summary>Motivo de um DENIED.</summary>
+public enum DeniedReason : byte
+{
+    /// <summary>Segredo de pareamento inválido, expirado ou já usado.</summary>
+    InvalidPairingSecret = 1,
+    /// <summary>Chave de acesso desconhecida: nunca pareado ou removido.</summary>
+    UnknownDevice = 2,
+    /// <summary>HELLO com protocolVersion diferente da do PC.</summary>
+    IncompatibleVersion = 3,
+}
+
+/// <summary>Celular → PC, só na porta Wi-Fi: primeiro contato vindo do QR. Secret tem 32 bytes.</summary>
+public sealed record PairMessage(byte[] Secret, string DeviceName) : Message;
+
+/// <summary>PC → celular: chave de acesso (32 bytes) gerada no pareamento.</summary>
+public sealed record PairedMessage(byte[] Token) : Message;
+
+/// <summary>Celular → PC, só na porta Wi-Fi: apresenta a chave de acesso antes do HELLO.</summary>
+public sealed record AuthMessage(byte[] Token) : Message;
+
+/// <summary>PC → celular: recusa; o PC fecha a conexão em seguida.</summary>
+public sealed record DeniedMessage(DeniedReason Reason) : Message;

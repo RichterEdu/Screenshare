@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Text;
 
 namespace ScreenShare.Core.Protocol;
 
@@ -8,10 +9,15 @@ namespace ScreenShare.Core.Protocol;
 /// </summary>
 public static class MessageCodec
 {
-    public const ushort ProtocolVersion = 1;
+    public const ushort ProtocolVersion = 2;
     public const int HeaderSize = 5;
     public const int MaxPayloadLength = 16 * 1024 * 1024;
     public const int MaxTouchPointers = 10;
+    public const int SecretLength = 32;
+    public const int TokenLength = 32;
+    public const int MaxDeviceNameBytes = 64;
+
+    private static readonly UTF8Encoding StrictUtf8 = new(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);
 
     private const int TouchPointerSize = 14;
     private const VideoCodec KnownCodecs = VideoCodec.H264 | VideoCodec.H265;
@@ -67,6 +73,36 @@ public static class MessageCodec
                 }
                 return bytes;
             }
+            case PairMessage m:
+            {
+                RequireLength(m.Secret, SecretLength, "segredo");
+                var name = EncodeDeviceName(m.DeviceName);
+                var w = Begin(MessageType.Pair, SecretLength + 1 + name.Length, out var bytes);
+                w.WriteBytes(m.Secret);
+                w.WriteByte((byte)name.Length);
+                w.WriteBytes(name);
+                return bytes;
+            }
+            case PairedMessage m:
+            {
+                RequireLength(m.Token, TokenLength, "chave");
+                var w = Begin(MessageType.Paired, TokenLength, out var bytes);
+                w.WriteBytes(m.Token);
+                return bytes;
+            }
+            case AuthMessage m:
+            {
+                RequireLength(m.Token, TokenLength, "chave");
+                var w = Begin(MessageType.Auth, TokenLength, out var bytes);
+                w.WriteBytes(m.Token);
+                return bytes;
+            }
+            case DeniedMessage m:
+            {
+                var w = Begin(MessageType.Denied, 1, out var bytes);
+                w.WriteByte((byte)m.Reason);
+                return bytes;
+            }
             case PingMessage m:
             {
                 var w = Begin(MessageType.Ping, 8, out var bytes);
@@ -99,6 +135,10 @@ public static class MessageCodec
             MessageType.Config => DecodeConfig(ref r),
             MessageType.Frame => DecodeFrame(ref r),
             MessageType.Touch => DecodeTouch(ref r),
+            MessageType.Pair => DecodePair(ref r),
+            MessageType.Paired => new PairedMessage(r.ReadBytes(TokenLength)),
+            MessageType.Auth => new AuthMessage(r.ReadBytes(TokenLength)),
+            MessageType.Denied => DecodeDenied(ref r),
             MessageType.Ping => new PingMessage(r.ReadUInt64()),
             MessageType.Pong => new PongMessage(r.ReadUInt64()),
             MessageType.KeyframeRequest => new KeyframeRequestMessage(),
@@ -170,5 +210,52 @@ public static class MessageCodec
             pointers[i] = new TouchPointer(id, (TouchAction)action, x, y, pressure);
         }
         return new TouchMessage(pointers);
+    }
+
+    private static void RequireLength(byte[] value, int length, string what)
+    {
+        if (value.Length != length)
+            throw new ProtocolException($"O {what} precisa ter {length} bytes, tem {value.Length}.");
+    }
+
+    private static byte[] EncodeDeviceName(string name)
+    {
+        byte[] bytes;
+        try
+        {
+            bytes = StrictUtf8.GetBytes(name);
+        }
+        catch (EncoderFallbackException)
+        {
+            throw new ProtocolException("Nome do aparelho não é texto válido.");
+        }
+        if (bytes.Length is < 1 or > MaxDeviceNameBytes)
+            throw new ProtocolException($"Nome do aparelho precisa ter 1..{MaxDeviceNameBytes} bytes, tem {bytes.Length}.");
+        return bytes;
+    }
+
+    private static PairMessage DecodePair(ref PayloadReader r)
+    {
+        var secret = r.ReadBytes(SecretLength);
+        var nameLength = r.ReadByte();
+        if (nameLength is < 1 or > MaxDeviceNameBytes)
+            throw new ProtocolException($"Nome do aparelho precisa ter 1..{MaxDeviceNameBytes} bytes, tem {nameLength}.");
+        var nameBytes = r.ReadBytes(nameLength);
+        try
+        {
+            return new PairMessage(secret, StrictUtf8.GetString(nameBytes));
+        }
+        catch (DecoderFallbackException)
+        {
+            throw new ProtocolException("Nome do aparelho não é UTF-8 válido.");
+        }
+    }
+
+    private static DeniedMessage DecodeDenied(ref PayloadReader r)
+    {
+        var reason = r.ReadByte();
+        if (reason is < 1 or > 3)
+            throw new ProtocolException($"Motivo de DENIED desconhecido: {reason}.");
+        return new DeniedMessage((DeniedReason)reason);
     }
 }
