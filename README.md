@@ -48,8 +48,8 @@ O formato dos bytes trocados entre os dois lados está em [`docs/protocol.md`](d
 
 ## 🗺️ Roadmap
 
-- [x] **Parte 1 — Fundação**: protocolo v1 completo em C# — as 7 mensagens (`HELLO`, `CONFIG`, `FRAME`, `TOUCH`, `PING`, `PONG`, `KEYFRAME_REQ`) e o `MessageReader` — com 26 testes contra os vetores compartilhados
-- [ ] Parte 1 — lado Kotlin com os mesmos vetores (pronto no branch `android-app`, aguardando merge)
+- [x] **Parte 1 — Fundação**: protocolo v1 completo — as 7 mensagens (`HELLO`, `CONFIG`, `FRAME`, `TOUCH`, `PING`, `PONG`, `KEYFRAME_REQ`) e o `MessageReader` — em C# e em Kotlin (`android/`), testados contra os mesmos vetores
+- [x] **App Android e host de desenvolvimento** — app Compose descobre o PC (mDNS) ou aceita IP, faz o handshake e mostra a latência real (PING/PONG); `ScreenShare.DevHost` é o stub do lado do PC (sem vídeo)
 - [ ] **Parte 2** — Monitor virtual (instalação do VDD e `DisplayManager`)
 - [ ] **Parte 3** — Vídeo ponta a ponta no Wi-Fi + descoberta mDNS + overlay de latência
 - [ ] **Parte 4** — Conexão por cabo USB (`adb reverse`)
@@ -58,12 +58,25 @@ O formato dos bytes trocados entre os dois lados está em [`docs/protocol.md`](d
 
 ## 🚀 Começando
 
-Pré-requisito: [.NET 10 SDK](https://dotnet.microsoft.com/download).
+Pré-requisitos: [.NET 10 SDK](https://dotnet.microsoft.com/download) (host) e [Android Studio](https://developer.android.com/studio) (app).
 
 ```bash
 git clone https://github.com/RichterEdu/Screenshare.git
 cd Screenshare/host
 dotnet test
+```
+
+Para testar o app sem o host real, rode o host de desenvolvimento (libere a porta 38700 no Firewall do Windows se ele pedir) e abra o app no celular, na mesma rede Wi-Fi:
+
+```bash
+dotnet run --project host/ScreenShare.DevHost
+```
+
+App Android (usa o JDK do Android Studio):
+
+```powershell
+$env:JAVA_HOME = 'C:\Program Files\Android\Android Studio\jbr'
+.\android\gradlew.bat -p android :app:testDebugUnitTest
 ```
 
 ## 📚 Documentação

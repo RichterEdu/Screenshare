@@ -71,6 +71,9 @@ Cada ponteiro: `id` u8, `action` u8 (0 DOWN, 1 MOVE, 2 UP, 3 CANCEL), `x` f32, `
 ### KEYFRAME_REQ
 Sem payload. O celular pede um keyframe depois de um erro de decodificação.
 
+## Descoberta (Wi-Fi)
+O host anuncia por mDNS/DNS-SD o serviço **`_screenshare._tcp`**, com a porta TCP do protocolo (padrão 38700) e o nome da máquina como nome da instância. O app Android o encontra com o `NsdManager`; se a rede bloquear multicast, o usuário digita `IP` ou `IP:porta`. No USB não há descoberta: o app conecta em `127.0.0.1` depois do `adb reverse`.
+
 ## Validação
 - Payload com bytes faltando ou sobrando é erro; tipo desconhecido é erro.
 - Erros de protocolo: `ProtocolException` (subclasse de `IOException`) em C# e Kotlin.
