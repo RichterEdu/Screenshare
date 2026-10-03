@@ -2,6 +2,8 @@ package dev.screenshare.android.security
 
 import androidx.datastore.preferences.core.PreferenceDataStoreFactory
 import java.io.File
+import java.security.ProviderException
+import java.util.Base64
 import javax.crypto.AEADBadTagException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -37,6 +39,12 @@ class PairingStoreTest {
         override fun decrypt(sealed: ByteArray): ByteArray = throw AEADBadTagException("chave do Keystore perdida")
     }
 
+    /** Simula o Keystore quebrando com uma RuntimeException (comum em alguns aparelhos), não só com GeneralSecurityException. */
+    private object BrokenKeystoreCipher : TokenCipher {
+        override fun encrypt(plain: ByteArray) = XorCipher.encrypt(plain)
+        override fun decrypt(sealed: ByteArray): ByteArray = throw ProviderException("Keystore indisponível")
+    }
+
     @After
     fun tearDown() = scope.cancel()
 
@@ -59,12 +67,24 @@ class PairingStoreTest {
 
         val bytes = file.readBytes()
         assertFalse(bytes.toList().windowed(pc.token.size).any { it == pc.token.toList() })
+        // O DataStore guarda o valor como texto: se a cifra fosse pulada, o Base64 do token apareceria no arquivo.
+        val tokenAsBase64 = Base64.getEncoder().encodeToString(pc.token)
+        assertFalse(String(bytes, Charsets.ISO_8859_1).contains(tokenAsBase64))
     }
 
     @Test
     fun undecryptableTokenForgetsThePairingInsteadOfCrashing() = runBlocking {
         PairingStore(dataStore, XorCipher).save(pc)
         val store = PairingStore(dataStore, LostKeyCipher)
+
+        assertNull(store.load())
+        assertNull(PairingStore(dataStore, XorCipher).load()) // foi apagado
+    }
+
+    @Test
+    fun keystoreRuntimeFailureForgetsThePairingInsteadOfCrashing() = runBlocking {
+        PairingStore(dataStore, XorCipher).save(pc)
+        val store = PairingStore(dataStore, BrokenKeystoreCipher)
 
         assertNull(store.load())
         assertNull(PairingStore(dataStore, XorCipher).load()) // foi apagado

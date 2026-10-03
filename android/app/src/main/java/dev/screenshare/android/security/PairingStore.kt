@@ -6,9 +6,9 @@ import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
-import java.security.GeneralSecurityException
 import java.util.Base64
 import java.util.Objects
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.first
 
 /** O PC pareado com este celular. [token] é a chave de acesso em claro (só em memória). */
@@ -32,21 +32,38 @@ val Context.pairingDataStore: DataStore<Preferences> by preferencesDataStore(nam
  * (chave do Keystore perdida após reinstalação ou backup), o pareamento é apagado e [load] devolve null.
  */
 class PairingStore(private val dataStore: DataStore<Preferences>, private val cipher: TokenCipher) {
+    /**
+     * Devolve o PC pareado, ou null se não há nenhum ou se não foi possível recuperá-lo. Nunca lança (exceto
+     * [CancellationException]): o Keystore pode falhar de muitas formas nos aparelhos reais (ProviderException,
+     * IOException, exceções de serviço do sistema) e o DataStore pode estar corrompido ou ilegível. Quem chama
+     * (a tela inicial) não tem como se recuperar disso, então qualquer falha vira "esquecer o pareamento e pedir
+     * para parear de novo".
+     */
     suspend fun load(): PairedPc? {
-        val prefs = dataStore.data.first()
-        val name = prefs[NAME] ?: return null
-        val fingerprint = prefs[FINGERPRINT] ?: return null
-        val sealed = prefs[TOKEN] ?: return null
-        val token = try {
-            cipher.decrypt(Base64.getDecoder().decode(sealed))
-        } catch (_: GeneralSecurityException) {
-            clear()
-            return null
-        } catch (_: IllegalArgumentException) {
-            clear()
+        try {
+            val prefs = dataStore.data.first()
+            val name = prefs[NAME] ?: return null
+            val fingerprint = prefs[FINGERPRINT] ?: return null
+            val sealed = prefs[TOKEN] ?: return null
+            val token = cipher.decrypt(Base64.getDecoder().decode(sealed))
+            return PairedPc(name, fingerprint, token, prefs[LAST_HOST])
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            forgetBestEffort()
             return null
         }
-        return PairedPc(name, fingerprint, token, prefs[LAST_HOST])
+    }
+
+    /** Apaga o pareamento sem deixar a falha de apagar escapar: se nem isso der, o próximo load() tenta de novo. */
+    private suspend fun forgetBestEffort() {
+        try {
+            clear()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            // melhor esforço
+        }
     }
 
     suspend fun save(pc: PairedPc) {
