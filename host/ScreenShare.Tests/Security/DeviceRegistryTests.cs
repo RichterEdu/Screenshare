@@ -87,4 +87,59 @@ public sealed class DeviceRegistryTests : IDisposable
         var (device, token) = registry.Add("Pixel 8"); // continua funcionando depois
         Assert.Equal(device, new DeviceRegistry(FilePath).Authenticate(token));
     }
+
+    [Theory]
+    [InlineData("[null]")]
+    [InlineData("[{\"id\":\"a\",\"name\":\"x\",\"pairedAt\":\"2026-10-03T12:00:00+00:00\"}]")]
+    [InlineData("[{\"id\":\"a\",\"name\":\"x\",\"tokenSha256\":\"zz\",\"pairedAt\":\"2026-10-03T12:00:00+00:00\"}]")]
+    [InlineData("[{\"id\":\"a\",\"name\":\"x\",\"tokenSha256\":\"abc\",\"pairedAt\":\"2026-10-03T12:00:00+00:00\"}]")]
+    public void Malformed_entries_treated_as_corruption(string json)
+    {
+        Directory.CreateDirectory(_dir);
+        File.WriteAllText(FilePath, json);
+        var logs = new List<string>();
+
+        var registry = new DeviceRegistry(FilePath, log: logs.Add);
+
+        Assert.Empty(registry.Devices);
+        Assert.Equal(json, File.ReadAllText(FilePath + ".bak"));
+        Assert.Single(logs);
+        var (device, token) = registry.Add("Pixel 8");
+        Assert.Equal(device, new DeviceRegistry(FilePath).Authenticate(token));
+    }
+
+    [Fact]
+    public void Removal_survives_a_restart()
+    {
+        var (device, token) = new DeviceRegistry(FilePath).Add("Pixel 8");
+
+        new DeviceRegistry(FilePath).Remove(device.Id);
+
+        var reloaded = new DeviceRegistry(FilePath);
+        Assert.Null(reloaded.Authenticate(token));
+        Assert.Empty(reloaded.Devices);
+    }
+
+    [Fact]
+    public void Failed_save_on_remove_keeps_the_device()
+    {
+        var registry = new DeviceRegistry(FilePath);
+        var (device, token) = registry.Add("Pixel 8");
+
+        File.SetAttributes(FilePath, FileAttributes.ReadOnly);
+        try
+        {
+            var ex = Record.Exception(() => registry.Remove(device.Id));
+            Assert.NotNull(ex);
+            Assert.True(ex is IOException or UnauthorizedAccessException, $"Expected IOException or UnauthorizedAccessException, got {ex?.GetType().Name}");
+
+            Assert.Equal(device, registry.Authenticate(token));
+            var reloaded = new DeviceRegistry(FilePath);
+            Assert.Equal(device, reloaded.Authenticate(token));
+        }
+        finally
+        {
+            File.SetAttributes(FilePath, FileAttributes.Normal);
+        }
+    }
 }

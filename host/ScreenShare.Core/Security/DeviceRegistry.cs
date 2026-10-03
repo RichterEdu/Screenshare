@@ -48,8 +48,9 @@ public sealed class DeviceRegistry
             Convert.ToHexStringLower(SHA256.HashData(token)), _clock.GetUtcNow());
         lock (_lock)
         {
+            var newList = new List<PairedDevice>(_devices) { device };
+            Save(newList);
             _devices.Add(device);
-            Save();
         }
         return (device, token);
     }
@@ -75,8 +76,11 @@ public sealed class DeviceRegistry
     {
         lock (_lock)
         {
-            if (_devices.RemoveAll(d => d.Id == id) == 0) return false;
-            Save();
+            if (!_devices.Any(d => d.Id == id)) return false;
+            var newList = new List<PairedDevice>(_devices);
+            newList.RemoveAll(d => d.Id == id);
+            Save(newList);
+            _devices.RemoveAll(d => d.Id == id);
             return true;
         }
     }
@@ -86,22 +90,42 @@ public sealed class DeviceRegistry
         if (!File.Exists(_path)) return [];
         try
         {
-            return JsonSerializer.Deserialize<List<PairedDevice>>(File.ReadAllText(_path), JsonOptions) ?? [];
+            var devices = JsonSerializer.Deserialize<List<PairedDevice>>(File.ReadAllText(_path), JsonOptions) ?? [];
+            ValidateDevices(devices);
+            return devices;
         }
-        catch (JsonException e)
+        catch (Exception e) when (e is JsonException or InvalidOperationException)
         {
             File.Copy(_path, _path + ".bak", overwrite: true);
-            log?.Invoke($"Lista de aparelhos pareados corrompida ({e.Message}). Começando vazia; cópia em {_path}.bak");
+            log?.Invoke($"Lista de aparelhos pareados corrompida (entrada inválida). Começando vazia; cópia em {_path}.bak");
             return [];
         }
     }
 
+    private static void ValidateDevices(List<PairedDevice> devices)
+    {
+        foreach (var device in devices)
+        {
+            if (device == null)
+                throw new InvalidOperationException("entrada null");
+            if (string.IsNullOrEmpty(device.Id) || string.IsNullOrEmpty(device.Name) || string.IsNullOrEmpty(device.TokenSha256))
+                throw new InvalidOperationException("entrada com campo null");
+            if (device.TokenSha256.Length != 64 || !IsValidHex(device.TokenSha256))
+                throw new InvalidOperationException("TokenSha256 inválido");
+        }
+    }
+
+    private static bool IsValidHex(string s)
+    {
+        return s.All(c => "0123456789abcdef".Contains(char.ToLowerInvariant(c)));
+    }
+
     /// <summary>Grava num arquivo temporário e renomeia, para nunca deixar o JSON pela metade.</summary>
-    private void Save()
+    private void Save(List<PairedDevice> devices)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(_path))!);
         var temporary = _path + ".tmp";
-        File.WriteAllText(temporary, JsonSerializer.Serialize(_devices, JsonOptions));
+        File.WriteAllText(temporary, JsonSerializer.Serialize(devices, JsonOptions));
         File.Move(temporary, _path, overwrite: true);
     }
 }
