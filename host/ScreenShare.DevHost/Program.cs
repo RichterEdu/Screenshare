@@ -16,8 +16,12 @@ Console.CancelKeyPress += (_, e) =>
 using var server = new HostServer(port, message => Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] {message}"));
 server.Start();
 
+// Anuncia só IPs da LAN real; sem nenhum (ex.: sem gateway), cai no padrão da biblioteca (todos os IPs).
+var lanAddresses = LanAddressSelector.Select(AdapterInfo.FromSystem());
 using var discovery = new ServiceDiscovery();
-discovery.Advertise(new ServiceProfile(Environment.MachineName, "_screenshare._tcp", (ushort)server.Port));
+discovery.Advertise(new ServiceProfile(
+    Environment.MachineName, "_screenshare._tcp", (ushort)server.Port, lanAddresses.Count > 0 ? lanAddresses : null));
 
-Console.WriteLine($"ScreenShare DevHost escutando na porta {server.Port} como \"{Environment.MachineName}\" (_screenshare._tcp). Ctrl+C para sair.");
+Console.WriteLine($"ScreenShare DevHost escutando na porta {server.Port} como \"{Environment.MachineName}\" (_screenshare._tcp).");
+Console.WriteLine($"IPs anunciados: {(lanAddresses.Count > 0 ? string.Join(", ", lanAddresses) : "todos")}. Ctrl+C para sair.");
 await server.RunAsync(cts.Token);
