@@ -13,15 +13,19 @@ Console.CancelKeyPress += (_, e) =>
     cts.Cancel();
 };
 
-using var server = new HostServer(port, message => Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] {message}"));
+var dataDirectory = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "ScreenShare");
+using var identity = ScreenShare.Core.Security.HostIdentity.LoadOrCreate(dataDirectory, Environment.MachineName);
+var devices = new ScreenShare.Core.Security.DeviceRegistry(Path.Combine(dataDirectory, "paired-devices.json"));
+using var server = new HostServer(port, 38701, identity, new ScreenShare.Core.Security.PairingSession(TimeProvider.System), devices,
+    message => Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] {message}"));
 server.Start();
 
 // Anuncia só IPs da LAN real; sem nenhum (ex.: sem gateway), cai no padrão da biblioteca (todos os IPs).
 var lanAddresses = LanAddressSelector.Select(AdapterInfo.FromSystem());
 using var discovery = new ServiceDiscovery();
 discovery.Advertise(new ServiceProfile(
-    Environment.MachineName, "_screenshare._tcp", (ushort)server.Port, lanAddresses.Count > 0 ? lanAddresses : null));
+    Environment.MachineName, "_screenshare._tcp", (ushort)server.WifiPort, lanAddresses.Count > 0 ? lanAddresses : null));
 
-Console.WriteLine($"ScreenShare DevHost escutando na porta {server.Port} como \"{Environment.MachineName}\" (_screenshare._tcp).");
+Console.WriteLine($"ScreenShare DevHost escutando na porta {server.WifiPort} como \"{Environment.MachineName}\" (_screenshare._tcp).");
 Console.WriteLine($"IPs anunciados: {(lanAddresses.Count > 0 ? string.Join(", ", lanAddresses) : "todos")}. Ctrl+C para sair.");
 await server.RunAsync(cts.Token);
