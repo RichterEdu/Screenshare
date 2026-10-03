@@ -49,7 +49,7 @@ O formato dos bytes trocados entre os dois lados está em [`docs/protocol.md`](d
 ## 🗺️ Roadmap
 
 - [x] **Parte 1 — Fundação**: solução .NET e protocolo v1 (`HELLO`, `PING`, `PONG`, `KEYFRAME_REQ`) com testes
-- [ ] Parte 1 — mensagens `CONFIG`, `FRAME`, `TOUCH` e lado Kotlin com os mesmos vetores
+- [x] Parte 1 — mensagens `CONFIG`, `FRAME`, `TOUCH` e lado Kotlin (`android/`) com os mesmos vetores
 - [ ] **Parte 2** — Monitor virtual (instalação do VDD e `DisplayManager`)
 - [ ] **Parte 3** — Vídeo ponta a ponta no Wi-Fi + descoberta mDNS + overlay de latência
 - [ ] **Parte 4** — Conexão por cabo USB (`adb reverse`)
@@ -58,12 +58,19 @@ O formato dos bytes trocados entre os dois lados está em [`docs/protocol.md`](d
 
 ## 🚀 Começando
 
-Pré-requisito: [.NET 10 SDK](https://dotnet.microsoft.com/download).
+Pré-requisitos: [.NET 10 SDK](https://dotnet.microsoft.com/download) (host) e [Android Studio](https://developer.android.com/studio) (app).
 
 ```bash
 git clone https://github.com/RichterEdu/Screenshare.git
 cd Screenshare/host
 dotnet test
+```
+
+App Android (usa o JDK do Android Studio):
+
+```powershell
+$env:JAVA_HOME = 'C:\Program Files\Android\Android Studio\jbr'
+.\android\gradlew.bat -p android :app:testDebugUnitTest
 ```
 
 ## 📚 Documentação
