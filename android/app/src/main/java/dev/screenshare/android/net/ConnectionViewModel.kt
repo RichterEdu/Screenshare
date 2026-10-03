@@ -19,7 +19,7 @@ class ConnectionViewModel(application: Application) : AndroidViewModel(applicati
         .catch { emit(emptyList()) } // sem permissão/serviço NSD: a entrada manual continua funcionando
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(stopTimeoutMillis = 5_000), emptyList())
 
-    fun connect(address: HostAddress) = connection.connect(address.host, address.port)
+    fun connect(address: HostAddress) = connection.connect(ConnectTarget.Usb())
 
     fun disconnect() = connection.disconnect()
 
