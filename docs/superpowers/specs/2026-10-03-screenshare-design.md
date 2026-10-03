@@ -6,7 +6,7 @@ Apps existentes de "segunda tela" exigem configurações chatas ou não oferecem
 Pasta do projeto está vazia (projeto novo). Uso pessoal → sem assinatura própria de driver.
 
 ## Decisões
-- PC: Windows 10/11, **C# .NET 8**, app de bandeja. Android: **Kotlin**, app nativo.
+- PC: Windows 10/11, **C# .NET 10**, app de bandeja. Android: **Kotlin**, app nativo.
 - Monitor virtual: **Virtual Display Driver** open source já assinado (github.com/VirtualDrivers/Virtual-Display-Driver) — instalado uma vez; resolução configurada via seu XML de config.
 - Captura: **DXGI Desktop Duplication** só da saída do monitor virtual (`Vortice.Windows`).
 - Encode: **H.265 (fallback H.264)** em hardware via Media Foundation (NVENC/QSV/AMF), low-latency, sem B-frames, GOP ~2 s, bitrate alto (LAN/USB). Fallback para MFT de software.

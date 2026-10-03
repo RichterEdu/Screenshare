@@ -1,0 +1,2 @@
+# KEYFRAME_REQ — sem payload
+07 00 00 00 00   # type=KEYFRAME_REQ, length=0

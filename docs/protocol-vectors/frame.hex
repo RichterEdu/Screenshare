@@ -1,0 +1,5 @@
+# FRAME — keyframe, t=1000000 us, 7 bytes de dados
+03 10 00 00 00            # type=FRAME, length=16
+40 42 0F 00 00 00 00 00   # timestampUs=1000000
+01                        # flags=keyframe
+00 00 00 01 26 01 AF      # data

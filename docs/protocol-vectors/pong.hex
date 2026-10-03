@@ -1,0 +1,3 @@
+# PONG — timestampUs=123456789
+06 08 00 00 00            # type=PONG, length=8
+15 CD 5B 07 00 00 00 00   # timestampUs=123456789

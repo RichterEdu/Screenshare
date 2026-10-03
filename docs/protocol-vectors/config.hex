@@ -1,0 +1,8 @@
+# CONFIG — 2400x1080, H.265, 20000 kbps, 8 bytes de codec config
+02 13 00 00 00            # type=CONFIG, length=19
+60 09                     # width=2400
+38 04                     # height=1080
+02                        # codec=H265
+20 4E 00 00               # bitrateKbps=20000
+08 00                     # codecConfigLength=8
+00 00 00 01 40 01 0C 01   # codecConfig

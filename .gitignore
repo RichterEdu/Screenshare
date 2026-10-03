@@ -1,0 +1,17 @@
+# .NET
+bin/
+obj/
+.vs/
+*.user
+TestResults/
+
+# Android / Gradle
+.gradle/
+.kotlin/
+build/
+local.properties
+*.iml
+
+# IDEs
+.idea/
+.vscode/
