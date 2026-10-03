@@ -1,6 +1,6 @@
 # Guia do código — ScreenShare (host Windows, C#)
 
-Este guia explica o código que já existe em `host/`, pensado para quem nunca viu C#. Estado descrito: commit `3c9da16` (protocolo v1 com HELLO, PING, PONG e KEYFRAME_REQ). Quando o código avançar, este guia precisa ser atualizado.
+Este guia explica o código que já existe em `host/`, pensado para quem nunca viu C#. Estado descrito: commit `6506c17` (protocolo v1 completo: as 7 mensagens HELLO, CONFIG, FRAME, TOUCH, PING, PONG e KEYFRAME_REQ, mais o `MessageReader`). Quando o código avançar, este guia precisa ser atualizado.
 
 ## 1. Visão geral em 1 minuto
 
@@ -11,12 +11,14 @@ O projeto transforma o celular Android numa segunda tela do PC:
 
 Os dois conversam por **uma conexão TCP**, que é só um "cano" por onde passam bytes. Os bytes precisam ter um formato combinado, senão um lado não entende o outro. Esse formato é o **protocolo** (descrito em `docs/protocol.md`).
 
-O código atual faz uma coisa só: **traduzir entre objetos C# (`HelloMessage`, `PingMessage`...) e bytes**. Ainda não abre rede, não captura tela, não tem vídeo. Isso vem nas próximas partes do plano.
+O código atual faz duas coisas: **traduzir entre objetos C# (`HelloMessage`, `PingMessage`...) e bytes** (o `MessageCodec`) e **ler mensagens inteiras de um fluxo de bytes** (o `MessageReader`). Ainda não abre rede, não captura tela, não tem vídeo. Isso vem nas próximas partes do plano.
 
 ```
 objeto C#  ──Encode──▶  bytes  ──(rede, futuro)──▶  bytes  ──Decode──▶  objeto C#
 PingMessage(123)                                                       PingMessage(123)
 ```
+
+No caminho de volta, o `MessageReader` lê o fluxo de bytes, junta os pedaços de uma mensagem inteira e chama o `Decode` por você (seção 5.6).
 
 ## 2. Mapa dos arquivos
 
@@ -26,10 +28,14 @@ PingMessage(123)                                                       PingMessa
 | `host/ScreenShare.Core/ScreenShare.Core.csproj` | Projeto da biblioteca principal (a lógica). Define .NET 10 e liga `ImplicitUsings` e `Nullable` (ver glossário). |
 | `host/ScreenShare.Core/Protocol/Messages.cs` | Define **quais mensagens existem** e quais dados cada uma carrega. |
 | `host/ScreenShare.Core/Protocol/MessageCodec.cs` | O tradutor: `Encode` (objeto → bytes) e `Decode` (bytes → objeto). |
+| `host/ScreenShare.Core/Protocol/MessageReader.cs` | O leitor: lê mensagens **completas** de um fluxo de bytes (`Stream`), juntando os pedaços que o TCP entrega. |
 | `host/ScreenShare.Core/Protocol/PayloadWriter.cs` | Ferramenta que **escreve** números em sequência dentro de um array de bytes. |
 | `host/ScreenShare.Core/Protocol/PayloadReader.cs` | Ferramenta que **lê** números em sequência de um array de bytes. |
 | `host/ScreenShare.Core/Protocol/ProtocolException.cs` | O tipo de erro lançado quando os bytes violam o protocolo. |
-| `host/ScreenShare.Tests/...` | Projeto de testes automáticos (xUnit). |
+| `host/ScreenShare.Tests/ScreenShare.Tests.csproj` | Projeto de testes automáticos (xUnit). Referencia o `Core` e copia os vetores `.hex` para a pasta de saída. |
+| `host/ScreenShare.Tests/Protocol/Vectors.cs` | Lê um arquivo `.hex` de `docs/protocol-vectors` e o transforma em `byte[]`. |
+| `host/ScreenShare.Tests/Protocol/MessageCodecTests.cs` | 21 casos de teste do `MessageCodec`: confere os vetores nos dois sentidos e rejeita mensagens inválidas. |
+| `host/ScreenShare.Tests/Protocol/MessageReaderTests.cs` | 5 testes do `MessageReader`: mensagens em sequência, entrega de 1 byte por vez, conexão cortada no meio e tamanho gigante. |
 | `docs/protocol.md` | Especificação do protocolo, a "fonte da verdade". |
 | `docs/protocol-vectors/*.hex` | Bytes de referência, usados pelo C# e pelo Kotlin para provarem que falam igual. |
 
@@ -56,9 +62,13 @@ Liga um recurso de segurança: o compilador avisa quando algo que pode ser `null
 | `uint` | 4 bytes, sem sinal | `u32` |
 | `ulong` | 8 bytes, sem sinal | `u64` |
 | `float` | 4 bytes, decimal | `f32` |
+| `bool` | `true` ou `false` (verdadeiro ou falso) | bit 0 do `flags` (`u8`) do FRAME |
 | `byte[]` | array (lista fixa) de bytes | |
 
 "Sem sinal" = só números ≥ 0 (o "u" vem de *unsigned*).
+
+**Literais numéricos (`0.25f`, `1_000_000`, `0x3E`)**
+Jeitos de escrever um número fixo no código. O `f` no fim marca um `float` (sem ele, `0.25` seria um `double`, um decimal de 8 bytes). Os `_` só facilitam a leitura: `1_000_000` vale 1000000. O prefixo `0x` indica hexadecimal: `0x3E` vale 62. Exemplos dos testes: `new TouchPointer(0, TouchAction.Move, 0.25f, 0.5f, 1.0f)` e `new FrameMessage(1_000_000, true, data)`.
 
 **`const`**
 Valor fixo, decidido na compilação. Ex.: `public const int HeaderSize = 5;`.
@@ -97,8 +107,16 @@ Isso já cria o campo `TimestampUs`, um construtor (`new PingMessage(123)`) e a 
 - `sealed` = ninguém pode herdar desta classe.
 - `readonly record struct TouchPointer(...)` = um record leve (struct) e imutável, para dados pequenos.
 
+**Expressão `with`**
+Cria uma **cópia** de um record trocando só alguns campos. Os testes do CONFIG e do FRAME precisam disso por causa de um detalhe da comparação por valor (ver `record`): ela compara campo a campo, mas um `byte[]` só é "igual" se for **o mesmo array**; ter o mesmo conteúdo não basta. O teste resolve isso copiando a mensagem original com o array trocado pelo que veio do `Decode` (assim o record compara todo o resto) e conferindo o conteúdo do array à parte:
+
+```csharp
+Assert.Equal(config with { CodecConfig = decoded.CodecConfig }, decoded);
+Assert.Equal(codecConfig, decoded.CodecConfig);
+```
+
 **Construtor primário**
-Em `ProtocolException(string message) : IOException(message)`, os parâmetros ficam logo depois do nome da classe e são repassados à classe-pai. A classe inteira cabe numa linha.
+Em `ProtocolException(string message) : IOException(message)`, os parâmetros ficam logo depois do nome da classe e são repassados à classe-pai. A classe inteira cabe numa linha. Em `MessageReader(Stream stream)` nada é repassado: o parâmetro `stream` fica disponível dentro da classe toda, como se fosse um campo (`stream.ReadAtLeastAsync(...)`).
 
 **`throw`**
 Lança um erro. Quem chamou pode capturar com `try/catch`; se ninguém capturar, o programa para.
@@ -123,8 +141,36 @@ Message message = kind switch
 ```
 Aqui o `switch` **devolve um valor**. O `=>` também aparece em métodos de uma linha (`public byte ReadByte() => Take(1)[0];`), que é só uma forma curta de `{ return ...; }`.
 
+**Padrões com `is`, `or` e `not`**
+`is` testa se um valor se encaixa num padrão, e os padrões podem ser combinados com `or` ("ou") e `not` ("não"). É uma forma curta de escrever comparações repetidas:
+
+```csharp
+if (m.Pointers.Count is < 1 or > MaxTouchPointers)       // "menor que 1 OU maior que o máximo"
+    throw new ProtocolException(...);
+
+if (codec is not (VideoCodec.H264 or VideoCodec.H265))   // "NÃO é (H264 ou H265)"
+    throw new ProtocolException(...);
+```
+
+A primeira condição diz "a quantidade é menor que 1 ou maior que o máximo", sem repetir `Count` duas vezes. A segunda vale para qualquer codec que não seja nem H264 nem H265 (os parênteses importam: o `not` vale para o grupo todo).
+
+**`condição ? a : b` (operador ternário)**
+Escolhe entre dois valores: se a condição for verdadeira, vale `a`; senão, vale `b`. No `Encode` do FRAME, `w.WriteByte(m.IsKeyframe ? (byte)1 : (byte)0);` grava `1` se o quadro for keyframe e `0` se não for.
+
+**Conversão explícita `(tipo)valor` (cast)**
+Pede ao compilador para tratar o valor como outro tipo. `w.WriteByte((byte)m.Pointers.Count)` converte o `Count` (um `int`) em `byte`; `(MessageType)type` transforma o byte `type` no `enum` correspondente, e `(byte)m.SupportedCodecs` faz o caminho inverso. Atenção: se o número não couber no tipo de destino, os bits que sobram são **cortados** em silêncio. Por isso o código confere os limites antes de converter (ex.: `ushort.MaxValue` no CONFIG).
+
+**`foreach` e `for`**
+Repetem um trecho de código. `foreach (var p in m.Pointers)` = "para cada dedo `p` da lista" (usado no `Encode` do TOUCH). `for (var i = 0; i < count; i++)` = "comece com `i = 0` e repita enquanto `i < count`, somando 1 a `i` a cada volta" (usado no `DecodeTouch`, para ler `count` dedos).
+
+**Coleções `[...]`**
+Forma curta de criar um array ou uma lista com os elementos entre colchetes; o tipo final vem do contexto. Nos testes, `byte[] codecConfig = [0x00, 0x00, 0x00, 0x01, 0x40, 0x01, 0x0C, 0x01];` cria um array de 8 bytes, e `new TouchMessage([ ... ])` passa a lista de dedos (o parâmetro é um `IReadOnlyList<TouchPointer>`: uma lista de `TouchPointer` que só pode ser lida, não alterada). `[]` é a coleção vazia: `new TouchMessage([])` é um TOUCH sem nenhum dedo, que o `Encode` precisa recusar.
+
 **`Span<byte>` e `ReadOnlySpan<byte>`**
 Uma "janela" sobre bytes que já existem na memória, **sem copiar**. `Span` permite escrever; `ReadOnlySpan` só ler. `bytes.AsSpan(5)` = janela que começa no byte 5. `_span[_position..]` = "do `_position` até o fim". É por isso que o código é rápido e quase não aloca memória.
+
+**Intervalos `..` e `^`**
+Dentro de colchetes, `..` quer dizer "até" e `^n` quer dizer "o n-ésimo a partir do fim" (é o mesmo recurso do `_span[_position..]`, visto acima). Nos testes, `ping[..^3]` é o vetor do PING **sem os 3 últimos bytes**, usado para simular uma conexão que cai no meio de uma mensagem.
 
 **`ref struct`**
 Um tipo que só pode viver na pilha (stack), exigência de quem guarda um `Span` dentro de si. Consequência prática: no `Decode`, o reader é passado como `ref PayloadReader r`, que significa "passe o **original**, não uma cópia", para que o avanço de `_position` seja visto por quem chamou.
@@ -141,6 +187,26 @@ String com valores embutidos. `{type:X2}` formata o número em hexadecimal com 2
 **`nameof(message)`**
 Vira o texto `"message"` na compilação, sem risco de erro de digitação.
 
+**`Stream`**
+Um fluxo de bytes que se lê aos poucos e em ordem, sem importar de onde vem: um arquivo, uma conexão de rede (`NetworkStream`) ou a memória (`MemoryStream`). O `MessageReader` aceita qualquer `Stream`; nos testes, `new MessageReader(new MemoryStream(bytes))` lê bytes que já estão na memória, como se tivessem chegado pela rede. (`Stream`, `MemoryStream` e `EndOfStreamException` vêm de `System.IO`, importado sozinho pelo `ImplicitUsings`.)
+
+**`async`, `await` e `Task<T>`**
+Esperar bytes da rede pode demorar. Em vez de travar o programa inteiro, o método é marcado `async` e devolve um `Task<T>`: uma "promessa" de que, mais tarde, haverá um resultado do tipo `T` (o que vai entre `<` e `>`). O `await` significa "espere aqui até a promessa se cumprir, mas deixe o resto do programa seguir enquanto isso".
+
+```csharp
+public async Task<Message?> ReadAsync(CancellationToken cancellationToken = default)
+...
+    await stream.ReadExactlyAsync(payload, cancellationToken);
+```
+
+`Task<Message?>` = "a promessa de uma `Message` (ou de `null`, ver `Nullable`)". Quem chama também usa `await`, como nos testes: `await reader.ReadAsync()`. Um `Task` sem `<T>` é uma promessa que não devolve valor: é o tipo dos testes `async`, como `public async Task Reads_consecutive_messages_then_null_at_clean_end()`. O nome de um método assíncrono costuma terminar em `Async` (`ReadAsync`).
+
+**`CancellationToken`**
+Um "botão de cancelar" entregue a uma operação demorada: se alguém o aciona, a espera é interrompida. Em `CancellationToken cancellationToken = default`, o `= default` torna o parâmetro **opcional**; sem argumento, vale um token que nunca é cancelado. Por isso os testes chamam `reader.ReadAsync()` com os parênteses vazios.
+
+**Argumento nomeado (`nome: valor`)**
+Escreve-se o nome do parâmetro antes do valor, para deixar claro o que ele significa. Em `stream.ReadAtLeastAsync(_header, _header.Length, throwOnEndOfStream: false, cancellationToken)`, o `false` é o valor de `throwOnEndOfStream` ("não lance erro se o fluxo acabar antes do esperado").
+
 ## 4. Conceitos de bytes
 
 **Little-endian.** Um número maior que 1 byte precisa de uma ordem. No protocolo, o byte **menos** significativo vem primeiro. Ex.: `2400` = `0x0960` → bytes `60 09`.
@@ -156,11 +222,11 @@ Vira o texto `"message"` na compilação, sem risco de erro de digitação.
 └──── cabeçalho: HeaderSize = 5 ─┘
 ```
 
-O `length` existe porque o TCP é um fluxo contínuo de bytes, sem divisão entre mensagens. O receptor lê 5 bytes, descobre o tamanho e então lê exatamente aquela quantidade.
+O `length` existe porque o TCP é um fluxo contínuo de bytes, sem divisão entre mensagens. O receptor lê 5 bytes, descobre o tamanho e então lê exatamente aquela quantidade (é o trabalho do `MessageReader`, seção 5.6). Cuidado com a palavra "quadro": aqui ela é o envelope que embrulha **qualquer** mensagem; o *quadro de vídeo* é só o conteúdo da mensagem `FRAME`.
 
-**Limite de 16 MiB.** `MaxPayloadLength` impede alguém (ou um bug) de mandar `length` gigante e fazer o programa reservar memória demais.
+**Limite de 16 MiB.** `MaxPayloadLength` (`16 * 1024 * 1024` = 16 777 216 bytes) impede alguém (ou um bug) de mandar `length` gigante e fazer o programa reservar memória demais. O `Begin` recusa escrever um payload maior que isso, e o `MessageReader` recusa ler um, **antes** de reservar a memória.
 
-**Annex-B / NAL units.** Formato usado pelo vídeo H.264/H.265 para separar pedaços da imagem comprimida. Só importa nas mensagens `CONFIG` e `FRAME` (ainda não implementadas no codec); por ora trate como "bytes de vídeo".
+**Annex-B / NAL units.** Formato usado pelo vídeo H.264/H.265 para separar pedaços da imagem comprimida. Só importa nas mensagens `CONFIG` e `FRAME`, onde o codec apenas carrega esses bytes (`CodecConfig` e `Data`), sem interpretá-los; por ora trate como "bytes de vídeo".
 
 ## 5. Passo a passo por arquivo
 
@@ -169,16 +235,16 @@ O `length` existe porque o TCP é um fluxo contínuo de bytes, sem divisão entr
 Declara os vocabulários do protocolo:
 
 - `MessageType`: o número que vai no byte `type` (Hello=1, Config=2, Frame=3, Touch=4, Ping=5, Pong=6, KeyframeRequest=7).
-- `VideoCodec`: H264=1, H265=2 (flags combináveis).
-- `TouchAction`: Down, Move, Up, Cancel (dedo encostou, moveu, soltou, gesto cancelado).
+- `VideoCodec`: H264=1, H265=2 (flags combináveis: o HELLO carrega uma combinação; o CONFIG, exatamente um).
+- `TouchAction`: Down=0, Move=1, Up=2, Cancel=3 (dedo encostou, moveu, soltou, gesto cancelado).
 - As mensagens, todas `record`s que herdam de `Message`:
 
 | Mensagem | Quem envia | O que carrega |
 |---|---|---|
 | `HelloMessage` | celular → PC (primeira) | versão do protocolo, largura/altura/dpi da tela, codecs suportados |
 | `ConfigMessage` | PC → celular | resolução, codec escolhido, bitrate, config do codec |
-| `FrameMessage` | PC → celular | um quadro de vídeo + se é keyframe |
-| `TouchMessage` | celular → PC | lista de dedos (`TouchPointer`) com posição 0..1 e pressão |
+| `FrameMessage` | PC → celular | um quadro de vídeo (`Data`), o instante da captura (`TimestampUs`) e se é keyframe |
+| `TouchMessage` | celular → PC | lista de dedos (`TouchPointer`), cada um com id, ação, posição 0..1 e pressão |
 | `PingMessage` / `PongMessage` | qualquer lado / resposta | um timestamp (para medir latência) |
 | `KeyframeRequestMessage` | celular → PC | nada (só "me mande um quadro completo") |
 
@@ -190,7 +256,7 @@ Escreve campos um depois do outro num `Span<byte>` já dimensionado.
 
 - `_position` é o "cursor": quantos bytes já foram escritos.
 - `WriteUInt16(value)` chama `BinaryPrimitives.WriteUInt16LittleEndian` para gravar 2 bytes na ordem little-endian na posição atual e depois faz `_position += 2`.
-- `WriteByte`, `WriteUInt32`, `WriteUInt64`, `WriteSingle`, `WriteBytes` seguem o mesmo padrão.
+- `WriteByte`, `WriteUInt32`, `WriteUInt64`, `WriteSingle`, `WriteBytes` seguem o mesmo padrão. (`WriteSingle` grava um `float`: `Single` é o nome do `float` no .NET.)
 - Não valida tamanho: se o span for pequeno, o .NET lança erro. Quem garante o tamanho certo é o `Begin` do codec.
 
 ### 5.3 `PayloadReader.cs`
@@ -198,41 +264,114 @@ Escreve campos um depois do outro num `Span<byte>` já dimensionado.
 O espelho do writer: lê campos em sequência de um `ReadOnlySpan<byte>`.
 
 - `Take(count)` é o coração: confere se ainda há `count` bytes (`count > _span.Length - _position` → lança `ProtocolException("Payload truncado.")`), devolve a fatia e avança o cursor.
-- `ReadByte`, `ReadUInt16` etc. são `Take` + conversão little-endian.
-- `ReadBytes(n)` e `ReadRemaining()` devolvem **cópia** (`.ToArray()`), porque o span original pode deixar de existir depois.
+- `ReadByte`, `ReadUInt16` etc. são `Take` + conversão little-endian (`ReadSingle` devolve um `float`).
+- `ReadBytes(n)` e `ReadRemaining()` devolvem **cópia** (`.ToArray()`), porque o span original pode deixar de existir depois. O CONFIG usa `ReadBytes` para o codec config; o FRAME usa `ReadRemaining` para o vídeo.
 - `EnsureEnd()` verifica que o cursor chegou exatamente ao fim. Sobrou byte → erro. Assim a mensagem precisa ter o tamanho **exato**.
 
 ### 5.4 `ProtocolException.cs`
 
-Um tipo de erro próprio. Herda de `IOException`, então código de rede que já captura erros de I/O captura esse também. Use-o para "os bytes não seguem o protocolo", e não para falhas de conexão.
+Um tipo de erro próprio. Herda de `IOException`, então código de rede que já captura erros de I/O captura esse também. Use-o para "os bytes não seguem o protocolo" (ou, no `Encode`, "esta mensagem não cabe no protocolo"), e não para falhas de conexão: quando a conexão cai no meio de uma mensagem, o erro é a `EndOfStreamException` do próprio .NET (seção 5.6).
 
 ### 5.5 `MessageCodec.cs`
 
-**Constantes:** `ProtocolVersion = 1`, `HeaderSize = 5`, `MaxPayloadLength = 16 MiB`, `MaxTouchPointers = 10`. `KnownCodecs` (privada) é a máscara `H264 | H265` usada para validar.
+**Constantes:** `ProtocolVersion = 1`, `HeaderSize = 5`, `MaxPayloadLength = 16 MiB`, `MaxTouchPointers = 10`. Duas constantes são privadas: `TouchPointerSize = 14` (os bytes de cada dedo no TOUCH: id 1 + ação 1 + x 4 + y 4 + pressão 4) e `KnownCodecs`, a máscara `H264 | H265` usada para validar.
 
 **`Encode(Message)`** — objeto → bytes:
 1. O `switch` descobre qual mensagem é.
-2. `Begin(tipo, tamanhoDoPayload, out bytes)` cria o array já com tamanho total (5 + payload), grava o `type` no byte 0 e o `length` nos bytes 1-4, e devolve um `PayloadWriter` posicionado logo depois do cabeçalho.
+2. `Begin(tipo, tamanhoDoPayload, out bytes)` cria o array já com tamanho total (5 + payload), grava o `type` no byte 0 e o `length` nos bytes 1-4, e devolve um `PayloadWriter` posicionado logo depois do cabeçalho. Se o payload passar de `MaxPayloadLength` (16 MiB), o `Begin` lança `ProtocolException` antes de criar o array.
 3. O `case` escreve os campos na ordem do protocolo (para HELLO: versão, largura, altura, dpi, codecs = 2+2+2+2+1 = **9** bytes).
 4. Devolve `bytes`.
-5. Tipo ainda não suportado → `ArgumentException`. (Hoje isso inclui Config, Frame e Touch.)
+5. Qualquer outra subclasse de `Message` → `ArgumentException`. Com as 7 mensagens do protocolo cobertas, isso só aconteceria com uma mensagem nova, que o `Encode` não conhece.
+
+O tamanho de payload que cada `case` passa ao `Begin` (`n` = quantidade de bytes de dados; no TOUCH, quantidade de dedos):
+
+| Mensagem | Payload | De onde vem a conta |
+|---|---|---|
+| HELLO | 9 | 2+2+2+2+1 |
+| CONFIG | `11 + n` | 2+2+1+4+2 = 11 de campos fixos, mais os `n` bytes do codec config |
+| FRAME | `9 + n` | 8 (timestamp) + 1 (flags) = 9, mais os `n` bytes do vídeo |
+| TOUCH | `1 + 14·n` | 1 (quantidade) + 14 (`TouchPointerSize`) por dedo |
+| PING / PONG | 8 | 8 (timestamp) |
+| KEYFRAME_REQ | 0 | nada |
 
 **`Decode(byte type, ReadOnlySpan<byte> payload)`** — bytes → objeto:
 1. Cria um `PayloadReader` sobre o payload.
 2. `kind switch` escolhe como ler cada tipo; tipo desconhecido → `ProtocolException`.
 3. `r.EnsureEnd()` garante que não sobrou nem faltou byte.
-4. Observe que o `Decode` recebe **só o payload**: quem lê da rede (futuro) vai ler o cabeçalho antes e entregar `type` e payload separados.
+4. Observe que o `Decode` recebe **só o payload**: quem lê o cabeçalho e entrega `type` e payload separados é o `MessageReader` (seção 5.6).
 
-**`DecodeHello`** lê os 5 campos na ordem e valida os codecs: `None` (0) ou bits desconhecidos → erro.
+**Mensagem por mensagem.** HELLO, CONFIG, FRAME e TOUCH têm, cada uma, o seu `DecodeXxx`, que lê os campos na ordem e valida o que dá para validar na hora (o `Take` do `PayloadReader` já garante que não falte byte). Todos os erros abaixo são `ProtocolException`.
 
-### 5.6 Ordem das ações (resumo do ciclo)
+- **HELLO** (`DecodeHello`) lê os 5 campos na ordem e valida os codecs: `None` (0) ou bits desconhecidos → erro.
+- **CONFIG** (PC → celular):
+  - `Encode`: antes de tudo confere `m.CodecConfig.Length > ushort.MaxValue` (65 535). O motivo: o tamanho do codec config é gravado num `u16`, e o `(ushort)` cortaria o tamanho de um array maior (70 000 viraria 4 464), gravando um valor errado. Depois grava largura (u16), altura (u16), codec (u8), bitrate (u32), o tamanho do codec config (u16) e os bytes do codec config.
+  - `DecodeConfig`: lê largura, altura e o byte do codec, e **já confere o codec**: `codec is not (VideoCodec.H264 or VideoCodec.H265)`. Só vale **exatamente** 1 ou 2: recusa 0 (nenhum) e 3 (os dois juntos; o HELLO pode oferecer os dois, mas o CONFIG tem de escolher um). Em seguida lê o bitrate (u32), o tamanho do codec config (u16) e `ReadBytes(tamanho)`: se o payload tiver menos bytes do que o tamanho declarado, o `Take` lança "Payload truncado.".
+- **FRAME** (PC → celular):
+  - `Encode`: grava o timestamp (u64), 1 byte de flags e os bytes do vídeo (`Data`). O byte de flags é `m.IsKeyframe ? (byte)1 : (byte)0`: o bit 0 diz "é keyframe" e os bits 1 a 7 ficam em 0.
+  - `DecodeFrame`: lê o timestamp (u64) e o byte `flags`. `IsKeyframe` é `(flags & 1) != 0`: o `& 1` apaga todos os bits menos o bit 0, e se sobrou algo diferente de 0, ele estava ligado; os bits 1 a 7 são ignorados. **Todo o resto do payload** (`ReadRemaining()`) é o vídeo, entregue sem o codec olhar dentro. O único erro possível é um payload com menos de 9 bytes (faltando timestamp ou flags).
+- **TOUCH** (celular → PC):
+  - `Encode`: primeiro confere `m.Pointers.Count is < 1 or > MaxTouchPointers` (precisa de 1 a 10 dedos). Depois grava 1 byte com a quantidade e, num `foreach`, 14 bytes por dedo: `Id` (u8), `Action` (u8), `X`, `Y` e `Pressure` (3 × f32). Só a quantidade é conferida aqui; ação e números finitos só são conferidos no `Decode`.
+  - `DecodeTouch`: lê a quantidade e confere 1 a 10 **antes de ler qualquer dedo**. Depois, para cada dedo (num `for`): lê o `id`; lê a ação e recusa se `action > (byte)TouchAction.Cancel` (só 0 a 3 valem); lê `x`, `y` e `pressure` e recusa se algum não for finito (`float.IsFinite` é falso para `NaN`, "não é um número", e para infinito). Um `x` ou `y` fora de 0..1 é aceito pelo protocolo.
+- **PING, PONG e KEYFRAME_REQ** não têm regras extras: o `Decode` lê direto o `u64` do timestamp (ou nada, no KEYFRAME_REQ) e o `EnsureEnd` confere o tamanho.
+
+### 5.6 `MessageReader.cs`
+
+O `Decode` só sabe traduzir um payload que já está inteiro na memória. Na rede, as coisas chegam de outro jeito: o TCP não preserva as fronteiras entre mensagens, ele entrega os bytes **em pedaços de tamanho imprevisível**. Uma leitura pode trazer só metade de um cabeçalho, ou o fim de uma mensagem junto com o começo da seguinte. Por isso alguém precisa ficar lendo até completar uma mensagem. Esse alguém é o `MessageReader`.
+
+Ao contrário do `MessageCodec` (`static`), o leitor guarda estado: o `Stream` que recebeu no construtor e o array `_header`, de 5 bytes (`HeaderSize`), criado junto com ele e reaproveitado a cada mensagem. Por isso se cria com `new MessageReader(stream)`. Ele tem um único método, `ReadAsync`:
+
+```csharp
+public async Task<Message?> ReadAsync(CancellationToken cancellationToken = default)
+{
+    var read = await stream.ReadAtLeastAsync(_header, _header.Length, throwOnEndOfStream: false, cancellationToken);
+    if (read == 0)
+        return null;
+    if (read < _header.Length)
+        throw new EndOfStreamException("Stream terminou dentro do cabeçalho de uma mensagem.");
+
+    var length = BinaryPrimitives.ReadUInt32LittleEndian(_header.AsSpan(1));
+    if (length > MessageCodec.MaxPayloadLength)
+        throw new ProtocolException($"Payload de {length} bytes excede o limite de {MessageCodec.MaxPayloadLength}.");
+
+    var payload = new byte[length];
+    await stream.ReadExactlyAsync(payload, cancellationToken);
+    return MessageCodec.Decode(_header[0], payload);
+}
+```
+
+Passo a passo:
+1. **Cabeçalho.** `ReadAtLeastAsync` fica lendo do `Stream` até juntar os 5 bytes do cabeçalho (`_header.Length`), por mais picados que cheguem, e devolve quantos bytes conseguiu. O `throwOnEndOfStream: false` pede para **não** lançar erro se o fluxo acabar antes; assim é o próprio leitor que decide o que fazer, nos dois passos seguintes.
+2. **Fim limpo.** `read == 0`: não chegou nenhum byte, ou seja, o fluxo terminou **exatamente entre duas mensagens**. Devolve `null`. Não é um erro: é a desconexão normal.
+3. **Corte no cabeçalho.** `read < _header.Length`: chegaram de 1 a 4 bytes e o fluxo acabou. Lança `EndOfStreamException`.
+4. **Tamanho.** O `length` (u32 little-endian) está nos bytes 1 a 4 do cabeçalho (`_header.AsSpan(1)`). Se passar de `MaxPayloadLength`, lança `ProtocolException` **antes** do `new byte[length]`. A ordem é a defesa: com um cabeçalho como `03 FF FF FF FF`, o programa tentaria reservar cerca de 4 GB só porque alguém mandou um número grande.
+5. **Payload.** `ReadExactlyAsync` lê exatamente `length` bytes (de novo, juntando os pedaços). Se o fluxo acabar antes de completar, o .NET lança `EndOfStreamException`: é o corte no meio do payload.
+6. **Decodificar.** `MessageCodec.Decode(_header[0], payload)` recebe o `type` (byte 0 do cabeçalho) e o payload. É o `Decode` que lança `ProtocolException` para tipo desconhecido, campo inválido, bytes faltando ou sobrando.
+
+Como o leitor lê exatamente 5 bytes e depois exatamente `length` bytes, ele nunca pega bytes da mensagem seguinte: a próxima chamada de `ReadAsync` recomeça de onde esta parou. É assim que várias mensagens coladas no mesmo fluxo saem uma de cada vez.
+
+Quando tudo dá certo, o resultado é a `Message` decodificada. Fora isso, o `ReadAsync` termina de **três jeitos**, que dizem coisas bem diferentes:
+
+| Resultado | O que significa |
+|---|---|
+| `null` | O fluxo acabou **exatamente entre duas mensagens**: fim limpo, desconexão normal. |
+| `EndOfStreamException` | A conexão caiu **no meio** de uma mensagem (dentro do cabeçalho ou do payload). |
+| `ProtocolException` | O `length` passa de 16 MiB (recusado **antes** de reservar memória) ou os bytes são inválidos (tipo desconhecido, campo inválido, bytes faltando ou sobrando). |
+
+O leitor não sabe nada de TCP: qualquer `Stream` serve. Nos testes é um `MemoryStream`; na Parte 3, será o fluxo da conexão com o celular.
+
+### 5.7 Ordem das ações (resumo do ciclo)
 
 ```
 Encode:  Message ─▶ switch ─▶ Begin (cabeçalho) ─▶ Write* (payload) ─▶ byte[]
 Decode:  (type, payload) ─▶ PayloadReader ─▶ Read* ─▶ EnsureEnd ─▶ Message
+Reader:  Stream ─▶ 5 bytes de cabeçalho ─▶ confere length ─▶ payload ─▶ Decode ─▶ Message
 ```
 
-## 6. Exemplo trabalhado: `PingMessage(123456789)`
+No `Reader`, o fluxo acabar antes do primeiro byte de uma mensagem dá `null`; acabar no meio dela dá `EndOfStreamException`.
+
+## 6. Exemplos trabalhados
+
+### 6.1 `PingMessage(123456789)`
 
 1. `Encode` cai no `case PingMessage m`, que chama `Begin(MessageType.Ping, 8, ...)`.
 2. `Begin` cria um array de `5 + 8 = 13` bytes e preenche o cabeçalho:
@@ -248,23 +387,118 @@ Decode:  (type, payload) ─▶ PayloadReader ─▶ Read* ─▶ EnsureEnd ─�
 
 O teste `Ping_matches_vector` confere os dois sentidos: o `Encode` gera esses bytes e o `Decode` desses bytes devolve um `PingMessage(123456789)`.
 
+### 6.2 `TouchMessage` com dois dedos
+
+O PING só tinha um número inteiro. O TOUCH traz `float`s, os números com casas decimais, como `0.25` ("um quarto da largura do monitor"). Como um `float` vira bytes? O exemplo é o do teste `Touch_matches_vector`:
+
+```csharp
+var touch = new TouchMessage([
+    new TouchPointer(0, TouchAction.Move, 0.25f, 0.5f, 1.0f),
+    new TouchPointer(1, TouchAction.Down, 0.75f, 0.125f, 0.5f),
+]);
+```
+
+(O `f` depois dos números marca um `float`; veja "Literais numéricos" no glossário.)
+
+1. `Encode` cai no `case TouchMessage m`, confere que há de 1 a 10 dedos (são 2) e chama `Begin(MessageType.Touch, 1 + TouchPointerSize * m.Pointers.Count, ...)`, ou seja, `1 + 14 * 2 = 29` bytes de payload.
+2. `Begin` cria um array de `5 + 29 = 34` bytes e preenche o cabeçalho:
+   - `bytes[0] = 4` (Touch)
+   - bytes 1-4 = `29` em u32 little-endian = `1D 00 00 00`
+3. `w.WriteByte((byte)m.Pointers.Count)` grava a quantidade de dedos (aqui, `02`).
+4. Para cada dedo `p`: `WriteByte(p.Id)`, `WriteByte((byte)p.Action)` e três `WriteSingle` (`p.X`, `p.Y` e `p.Pressure`). Dá 1 + 1 + 4 + 4 + 4 = **14** bytes por dedo.
+
+**Como `0.25f` vira `00 00 80 3E`.** Um `float` ocupa 32 bits (padrão **IEEE 754**), divididos em 3 partes: 1 bit de **sinal**, 8 bits de **expoente** e 23 bits de **fração**. É uma notação científica em binário: o número vale `1.fração` vezes 2 elevado ao expoente, com o sinal à parte. Para o `0.25`:
+
+- `0.25` é um quarto: 1.0 × 2⁻² (dois elevado a menos dois).
+- **Sinal:** `0` (positivo).
+- **Expoente:** o padrão guarda `expoente + 127` (assim o expoente não precisa de um bit de sinal só dele). Aqui: `-2 + 127 = 125`, que em binário é `01111101`.
+- **Fração:** nada além do `1.` que já está implícito, então são 23 zeros.
+
+```
+sinal  expoente   fração
+  0    01111101   00000000000000000000000      os 32 bits em sequência
+
+00111110  10000000  00000000  00000000         os mesmos bits, de 8 em 8
+   3E        80        00        00            em hexadecimal
+```
+
+Lido de uma vez, é `0x3E800000`. Como o protocolo é little-endian (menos significativo primeiro), os bytes vão para o fio na ordem inversa: **`00 00 80 3E`**. O `ReadSingle`, que o `Decode` usa, faz o caminho de volta: pega 4 bytes, desfaz a ordem e reconstrói o `0.25f`.
+
+Os outros números do vetor seguem a mesma conta:
+
+| Valor | Bytes no protocolo (little-endian) |
+|---|---|
+| `0.25` | `00 00 80 3E` |
+| `0.5` | `00 00 00 3F` |
+| `1.0` | `00 00 80 3F` |
+| `0.75` | `00 00 40 3F` |
+| `0.125` | `00 00 00 3E` |
+
+O resultado completo (34 bytes) é o conteúdo de `docs/protocol-vectors/touch.hex`; a parte depois do `#` é só comentário:
+
+```
+04 1D 00 00 00                              # type=TOUCH, length=29
+02                                          # count=2
+00 01 00 00 80 3E 00 00 00 3F 00 00 80 3F   # id=0 MOVE x=0.25 y=0.5 pressure=1.0
+01 00 00 00 40 3F 00 00 00 3E 00 00 00 3F   # id=1 DOWN x=0.75 y=0.125 pressure=0.5
+```
+
+Cada linha de dedo são os 14 bytes na ordem em que o `Encode` os escreveu. O primeiro, por partes:
+
+```
+00     01     00 00 80 3E   00 00 00 3F   00 00 80 3F
+id=0   MOVE   x=0.25        y=0.5         pressão=1.0
+```
+
+O teste `Touch_matches_vector` confere os dois sentidos: o `Encode` gera esses 34 bytes e o `Decode` deles devolve dois `TouchPointer` iguais aos originais.
+
 ## 7. Os testes
 
-**xUnit** é o framework de testes. O `.csproj` de testes referencia o projeto `Core` e os pacotes do xUnit.
+**xUnit** é o framework de testes. O `.csproj` de testes referencia o projeto `Core` e os pacotes do xUnit. São **26 casos de teste** em dois arquivos: `MessageCodecTests` (21) e `MessageReaderTests` (5).
 
 - `[Fact]` = um teste simples.
-- `[Theory]` + `[InlineData(...)]` = o mesmo teste rodado várias vezes com valores diferentes. Em `Hello_with_invalid_codec_flags_is_rejected`, roda com `0` (nenhum codec) e `4` (bit desconhecido).
+- `[Theory]` + `[InlineData(...)]` = o mesmo teste rodado várias vezes com valores diferentes (cada `[InlineData]` conta como um caso). Em `Hello_with_invalid_codec_flags_is_rejected`, roda com `0` (nenhum codec) e `4` (bit desconhecido); em `Touch_with_invalid_pointer_count_is_rejected`, com `0` e `11` dedos.
 - `Assert.Equal(esperado, atual)` falha o teste se forem diferentes; `Assert.Throws<ProtocolException>(...)` falha se o código **não** lançar aquele erro.
-- Os testes de erro cobrem: tipo desconhecido (`0x63`), payload truncado (8 bytes num HELLO que pede 9), bytes sobrando (9 bytes num PING que pede 8), flags de codec inválidas.
+- Mais três do xUnit que aparecem nos testes novos: `Assert.IsType<ConfigMessage>(x)` confere o tipo e devolve `x` já como esse tipo; `Assert.Null(x)` confere que `x` é `null`; `await Assert.ThrowsAsync<...>(...)` é o `Throws` para código `async`.
+
+**`MessageCodecTests` (21 casos).**
+- **7 de vetor**, um por mensagem (`Hello_matches_vector`, `Ping_...`, `Pong_...`, `KeyframeRequest_...`, `Config_...`, `Frame_...`, `Touch_...`): o `Encode` precisa gerar exatamente os bytes do `.hex`, e o `Decode` desses bytes precisa devolver a mensagem original. Os de CONFIG e FRAME usam a expressão `with` (ver glossário), por causa do `byte[]`.
+- **14 de erro**, todos esperando uma `ProtocolException`:
+  - os já existentes: tipo desconhecido (`0x63`), payload truncado (8 bytes num HELLO que pede 9), bytes sobrando (9 bytes num PING que pede 8) e flags de codec inválidas no HELLO (0 e 4);
+  - CONFIG: codec `3` (`H264|H265` não é um codec único) e um `codecConfigLength` que declara 8 bytes mas o payload traz só 2;
+  - FRAME: payload de 8 bytes, que não chega a ter o byte de flags;
+  - TOUCH: 0 e 11 dedos, ação `9` e `NaN` na coordenada x;
+  - no `Encode`: TOUCH sem nenhum dedo e CONFIG com 70 000 bytes de codec config (acima de 65 535).
+
+**`MessageReaderTests` (5 casos).** Todos são `async` e trocam a rede por fluxos de teste:
+- `Reads_consecutive_messages_then_null_at_clean_end`: junta os vetores de HELLO, PING e KEYFRAME_REQ numa sequência só, como se tivessem chegado um atrás do outro, e confere que o leitor devolve as três mensagens na ordem e depois `null`.
+- `Reassembles_messages_delivered_one_byte_at_a_time`: usa `OneByteAtATimeStream`, um `Stream` de teste (definido dentro do próprio arquivo) que entrega **no máximo 1 byte por leitura**, o pior caso de um TCP picotado. O vetor do TOUCH (34 bytes) ainda assim chega inteiro, com 2 dedos, e o fim do fluxo dá `null`.
+- `Stream_ending_inside_header_throws_EndOfStream`: só 2 bytes (`05 08`), metade de um cabeçalho → `EndOfStreamException`.
+- `Stream_ending_inside_payload_throws_EndOfStream`: o vetor do PING sem os 3 últimos bytes (`ping[..^3]`): cabeçalho completo e payload incompleto → `EndOfStreamException`.
+- `Oversized_length_is_rejected_before_reading_payload`: os 5 bytes `03 FF FF FF FF`, um FRAME que declara cerca de 4 GB de payload e não traz mais nada → `ProtocolException`. O leitor recusa só de olhar o `length`, sem tentar reservar nem ler o payload.
 
 **Vetores compartilhados.** A pasta `docs/protocol-vectors` tem os bytes exatos de cada mensagem. O `.csproj` de testes copia esses `.hex` para a pasta de saída (a linha `<None Include="..\..\docs\protocol-vectors\*.hex" ...>`), e `Vectors.Load("ping.hex")` os lê: ignora tudo depois de `#` (comentário), separa os pares hexadecimais e converte cada um em `byte` com `Convert.ToByte(token, 16)`. O app Android (Kotlin) testa contra os **mesmos arquivos**, então os dois lados provam que falam o mesmo "idioma" sem precisarem rodar juntos.
 
 ## 8. Como rodar e o que falta
 
-Dentro da pasta `host`:
+Na raiz do repositório:
 
 ```bash
-dotnet test
+dotnet test host
 ```
 
-**Ainda não implementado no codec:** `CONFIG`, `FRAME` e `TOUCH`. Os tipos já existem em `Messages.cs` e há vetores `.hex` para eles, mas `Encode` lança `ArgumentException` e `Decode` lança "tipo desconhecido" para esses três. Isso e o resto do sistema (rede, captura, vídeo, toque) vêm nas próximas partes do plano em `docs/superpowers/plans/`.
+(Se você já estiver dentro da pasta `host`, basta `dotnet test`.) O resultado esperado é **26 testes aprovados e nenhum com falha**. A última linha da saída fica assim; o tempo muda a cada execução e, num .NET em inglês, ela começa com `Passed!` e usa `Failed`, `Passed` e `Skipped`:
+
+```
+Aprovado!  – Com falha:     0, Aprovado:    26, Ignorado:     0, Total:    26, Duração: 34 ms - ScreenShare.Tests.dll (net10.0)
+```
+
+**O que falta.** No lado C#, a Parte 1 está completa: as 7 mensagens do protocolo, o `MessageCodec` e o `MessageReader`. O que ainda não existe é o resto do sistema (rede, captura, vídeo, toque), que vem nas próximas partes do roteiro. A tabela "Roteiro das partes", no plano da Parte 1 (em `docs/superpowers/plans/`), resume o que cada uma entrega, e cada parte ganha o seu plano quando chegar a vez dela:
+
+- **Parte 2 — Monitor virtual:** instalar o Virtual Display Driver (VDD) e criar o `DisplayManager`, que ativa e ajusta o monitor virtual no Windows.
+- **Parte 3 — Vídeo no Wi-Fi:** captura da tela, encode, conexão TCP, decodificação no celular, descoberta automática (mDNS) e overlay de latência. É aqui que o `MessageReader` passa a ler de uma conexão de verdade.
+- **Parte 4 — USB:** conexão por cabo, com `adb reverse`.
+- **Parte 5 — Toque:** capturar o toque no celular e injetá-lo no Windows (o `TouchMessage` que leva os dedos já existe).
+- **Parte 6 — Robustez:** reconexão, bandeja do sistema e qualidade.
+
+O app Android (Kotlin) implementa o **mesmo protocolo** e é testado contra os **mesmos vetores** `.hex`, o que garante que os dois lados vão se entender quando a conexão existir.
