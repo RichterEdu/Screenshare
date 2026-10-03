@@ -22,7 +22,8 @@ public sealed class HostServerTests : IAsyncLifetime
     {
         _identity = HostIdentity.LoadOrCreate(_dir, "PC de Teste");
         _devices = new DeviceRegistry(Path.Combine(_dir, "paired-devices.json"));
-        _server = new HostServer(0, 0, _identity, _pairing, _devices, handshakeTimeout: TimeSpan.FromSeconds(2));
+        _server = new HostServer(0, 0, _identity, _pairing, _devices,
+            handshakeTimeout: TimeSpan.FromSeconds(2), idleTimeout: TimeSpan.FromSeconds(2));
     }
 
     public Task InitializeAsync()
@@ -149,6 +150,56 @@ public sealed class HostServerTests : IAsyncLifetime
         await SendAsync(stream, new AuthMessage(token));
 
         Assert.Equal(new DeniedMessage(DeniedReason.UnknownDevice), await reader.ReadAsync(_cts.Token));
+        await AssertClosedAsync(reader);
+    }
+
+    [Fact]
+    public async Task Removed_device_sending_auth_and_hello_separately_still_gets_denied()
+    {
+        var (device, token) = _devices.Add("Pixel 8");
+        _devices.Remove(device.Id);
+
+        for (var attempt = 0; attempt < 5; attempt++)
+        {
+            var (client, stream, reader) = await ConnectWifiAsync();
+            using (client)
+            {
+                // o app manda AUTH e HELLO em escritas separadas (dois registros TLS)
+                await SendAsync(stream, new AuthMessage(token));
+                await SendAsync(stream, Hello());
+
+                Assert.Equal(new DeniedMessage(DeniedReason.UnknownDevice), await reader.ReadAsync(_cts.Token));
+            }
+        }
+    }
+
+    [Fact]
+    public async Task Registry_write_failure_during_pairing_does_not_kill_the_wifi_listener()
+    {
+        var (_, token) = _devices.Add("Pixel 8");
+        var registryFile = Path.Combine(_dir, "paired-devices.json");
+        File.SetAttributes(registryFile, FileAttributes.ReadOnly); // Add vai falhar ao gravar
+        try
+        {
+            var secret = _pairing.Begin();
+            var (broken, brokenStream, brokenReader) = await ConnectWifiAsync();
+            using (broken)
+            {
+                await SendAsync(brokenStream, new PairMessage(secret, "Pixel 9"));
+                await AssertClosedAsync(brokenReader);
+            }
+
+            // a porta Wi-Fi continua atendendo
+            var (client, stream, reader) = await ConnectWifiAsync();
+            using var _ = client;
+            await SendAsync(stream, new AuthMessage(token));
+            await SendAsync(stream, Hello());
+            Assert.IsType<ConfigMessage>(await reader.ReadAsync(_cts.Token));
+        }
+        finally
+        {
+            File.SetAttributes(registryFile, FileAttributes.Normal);
+        }
     }
 
     [Fact]
@@ -229,6 +280,25 @@ public sealed class HostServerTests : IAsyncLifetime
         using var _ = client;
         await SendAsync(stream, new AuthMessage(token));
         await SendAsync(stream, Hello());
+        Assert.IsType<ConfigMessage>(await reader.ReadAsync(_cts.Token));
+    }
+
+    [Fact]
+    public async Task Silent_client_after_config_is_dropped_after_the_idle_timeout_and_a_new_one_is_served()
+    {
+        var (silent, silentStream, silentReader) = await ConnectUsbAsync();
+        using (silent)
+        {
+            await SendAsync(silentStream, Hello());
+            Assert.IsType<ConfigMessage>(await silentReader.ReadAsync(_cts.Token));
+
+            await AssertClosedAsync(silentReader); // o aparelho sumiu: sem nada por 2 s, o PC derruba a conexão
+        }
+
+        var (client, stream, reader) = await ConnectUsbAsync();
+        using var _ = client;
+        await SendAsync(stream, Hello());
+
         Assert.IsType<ConfigMessage>(await reader.ReadAsync(_cts.Token));
     }
 

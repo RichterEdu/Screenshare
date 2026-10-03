@@ -1,7 +1,6 @@
 using System.Net;
 using System.Net.Security;
 using System.Net.Sockets;
-using System.Security.Authentication;
 using ScreenShare.Core.Protocol;
 using ScreenShare.Core.Security;
 
@@ -10,11 +9,14 @@ namespace ScreenShare.DevHost;
 /// <summary>
 /// Servidor de desenvolvimento (sem vídeo). Porta Wi-Fi: TLS obrigatório, depois PAIR/AUTH antes do HELLO.
 /// Porta USB: só em loopback (o `adb reverse` chega por ali), HELLO direto. Responde PING com PONG.
-/// Atende um cliente por vez em cada porta.
+/// Atende um cliente por vez em cada porta; um cliente mudo é derrubado por prazo (handshake e ociosidade).
 /// </summary>
 public sealed class HostServer : IDisposable
 {
     private const uint StubBitrateKbps = 8000;
+
+    /// <summary>Depois de um DENIED o PC espera o cliente terminar de falar por no máximo isto antes de fechar.</summary>
+    private static readonly TimeSpan DrainTimeout = TimeSpan.FromSeconds(1);
 
     private readonly TcpListener _wifi;
     private readonly TcpListener _usb;
@@ -23,9 +25,15 @@ public sealed class HostServer : IDisposable
     private readonly DeviceRegistry _devices;
     private readonly Action<string>? _log;
     private readonly TimeSpan _handshakeTimeout;
+    private readonly TimeSpan _idleTimeout;
 
+    /// <param name="handshakeTimeout">Prazo para TLS + PAIR/AUTH na porta Wi-Fi (padrão 10 s).</param>
+    /// <param name="idleTimeout">
+    /// Silêncio máximo numa sessão, em qualquer porta (padrão 10 s). O app manda PING a cada segundo,
+    /// então 10 s sem nada é conexão morta (celular sem Wi-Fi, fora de alcance) e não pode prender a porta.
+    /// </param>
     public HostServer(int wifiPort, int usbPort, HostIdentity identity, PairingSession pairing, DeviceRegistry devices,
-        Action<string>? log = null, TimeSpan? handshakeTimeout = null)
+        Action<string>? log = null, TimeSpan? handshakeTimeout = null, TimeSpan? idleTimeout = null)
     {
         _wifi = new TcpListener(IPAddress.Any, wifiPort);
         _usb = new TcpListener(IPAddress.Loopback, usbPort);
@@ -34,6 +42,7 @@ public sealed class HostServer : IDisposable
         _devices = devices;
         _log = log;
         _handshakeTimeout = handshakeTimeout ?? TimeSpan.FromSeconds(10);
+        _idleTimeout = idleTimeout ?? TimeSpan.FromSeconds(10);
     }
 
     /// <summary>Porta Wi-Fi (TLS) em que está escutando.</summary>
@@ -60,19 +69,19 @@ public sealed class HostServer : IDisposable
             while (true)
             {
                 using var client = await listener.AcceptTcpClientAsync(cancellationToken);
-                client.NoDelay = true;
-                _log?.Invoke($"Cliente conectado ({(secure ? "Wi-Fi" : "USB")}): {client.Client.RemoteEndPoint}");
                 try
                 {
+                    client.NoDelay = true;
+                    _log?.Invoke($"Cliente conectado ({(secure ? "Wi-Fi" : "USB")}): {client.Client.RemoteEndPoint}");
                     if (secure)
                         await ServeWifiAsync(client.GetStream(), cancellationToken);
                     else
                         await ServeSessionAsync(client.GetStream(), new MessageReader(client.GetStream()), cancellationToken);
                 }
-                catch (Exception e) when (e is IOException or AuthenticationException
-                                          || (e is OperationCanceledException && !cancellationToken.IsCancellationRequested))
+                catch (Exception e) when (!(e is OperationCanceledException && cancellationToken.IsCancellationRequested))
                 {
-                    // IOException inclui ProtocolException; OperationCanceledException aqui é o timeout do handshake
+                    // Qualquer falha ao atender UM cliente (rede, TLS, protocolo, prazo estourado, disco ao gravar o
+                    // registro...) encerra só essa conexão: a porta continua atendendo os próximos.
                     _log?.Invoke($"Conexão encerrada: {e.Message}");
                 }
                 _log?.Invoke("Cliente desconectado.");
@@ -100,7 +109,7 @@ public sealed class HostServer : IDisposable
         {
             if (!_pairing.TryConsume(pair.Secret))
             {
-                await SendAsync(tls, new DeniedMessage(DeniedReason.InvalidPairingSecret), cancellationToken);
+                await DenyAsync(tls, DeniedReason.InvalidPairingSecret, cancellationToken);
                 return;
             }
             var (device, token) = _devices.Add(pair.DeviceName);
@@ -112,7 +121,7 @@ public sealed class HostServer : IDisposable
         if (first is null) return; // cliente fechou
         if (first is not AuthMessage auth || _devices.Authenticate(auth.Token) is not { } known)
         {
-            await SendAsync(tls, new DeniedMessage(DeniedReason.UnknownDevice), cancellationToken);
+            await DenyAsync(tls, DeniedReason.UnknownDevice, cancellationToken);
             return;
         }
 
@@ -120,21 +129,21 @@ public sealed class HostServer : IDisposable
         await ServeSessionAsync(tls, reader, cancellationToken);
     }
 
-    /// <summary>HELLO → CONFIG, depois PING → PONG até o cliente sair.</summary>
-    private static async Task ServeSessionAsync(Stream stream, MessageReader reader, CancellationToken cancellationToken)
+    /// <summary>HELLO → CONFIG, depois PING → PONG até o cliente sair ou ficar mudo além do prazo ocioso.</summary>
+    private async Task ServeSessionAsync(Stream stream, MessageReader reader, CancellationToken cancellationToken)
     {
-        if (await reader.ReadAsync(cancellationToken) is not HelloMessage hello)
+        if (await ReadWithIdleDeadlineAsync(reader, cancellationToken) is not HelloMessage hello)
             return; // primeira mensagem não é HELLO: fecha
 
         if (hello.ProtocolVersion != MessageCodec.ProtocolVersion)
         {
-            await SendAsync(stream, new DeniedMessage(DeniedReason.IncompatibleVersion), cancellationToken);
+            await DenyAsync(stream, DeniedReason.IncompatibleVersion, cancellationToken);
             return;
         }
 
         await SendAsync(stream, new ConfigMessage(hello.Width, hello.Height, VideoCodec.H264, StubBitrateKbps, []), cancellationToken);
 
-        while (await reader.ReadAsync(cancellationToken) is { } message)
+        while (await ReadWithIdleDeadlineAsync(reader, cancellationToken) is { } message)
         {
             if (message is PingMessage ping)
                 await SendAsync(stream, new PongMessage(ping.TimestampUs), cancellationToken);
@@ -142,8 +151,55 @@ public sealed class HostServer : IDisposable
         }
     }
 
+    /// <summary>
+    /// Lê uma mensagem com prazo próprio (recriado a cada leitura). Se estourar, lança OperationCanceledException
+    /// com o token externo ainda ativo, que o laço de aceitação trata como conexão morta.
+    /// </summary>
+    private async Task<Message?> ReadWithIdleDeadlineAsync(MessageReader reader, CancellationToken cancellationToken)
+    {
+        using var idle = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        idle.CancelAfter(_idleTimeout);
+        return await reader.ReadAsync(idle.Token);
+    }
+
     private static Task SendAsync(Stream stream, Message message, CancellationToken cancellationToken) =>
         stream.WriteAsync(MessageCodec.Encode(message), cancellationToken).AsTask();
+
+    /// <summary>
+    /// Envia DENIED e fecha com educação. Fechar de imediato com entrada ainda pendente (ex.: o HELLO que vem logo
+    /// depois do AUTH) faz o Windows mandar RST, e o cliente descarta o DENIED que ainda não leu. Por isso: encerra o
+    /// nosso lado (close_notify no TLS, FIN no TCP puro) e descarta o que o cliente ainda mandar, até o fim da
+    /// conexão ou por no máximo <see cref="DrainTimeout"/>.
+    /// </summary>
+    private static async Task DenyAsync(Stream stream, DeniedReason reason, CancellationToken cancellationToken)
+    {
+        await SendAsync(stream, new DeniedMessage(reason), cancellationToken);
+
+        using var drain = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        drain.CancelAfter(DrainTimeout);
+        try
+        {
+            switch (stream)
+            {
+                case SslStream tls:
+                    await tls.ShutdownAsync();
+                    break;
+                case NetworkStream network:
+                    network.Socket.Shutdown(SocketShutdown.Send);
+                    break;
+            }
+
+            var buffer = new byte[256];
+            while (await stream.ReadAsync(buffer, drain.Token) > 0)
+            {
+                // descarta
+            }
+        }
+        catch (Exception e) when (e is IOException or SocketException or OperationCanceledException)
+        {
+            // o DENIED já foi enviado; o cliente sumir ou demorar a fechar não importa
+        }
+    }
 
     public void Dispose()
     {
