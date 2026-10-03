@@ -17,4 +17,11 @@ object Vectors {
             .map { it.toInt(16).toByte() }
             .toByteArray()
     }
+
+    /** Conteúdo de um vetor de texto (ex.: pairing-uri.txt), sem espaços nas pontas. */
+    fun text(name: String): String {
+        val file = File(dir, name)
+        require(file.isFile) { "vetor não encontrado: ${file.canonicalPath}" }
+        return file.readText().trim()
+    }
 }
