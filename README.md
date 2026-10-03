@@ -48,8 +48,8 @@ O formato dos bytes trocados entre os dois lados está em [`docs/protocol.md`](d
 
 ## 🗺️ Roadmap
 
-- [x] **Parte 1 — Fundação**: solução .NET e protocolo v1 (`HELLO`, `PING`, `PONG`, `KEYFRAME_REQ`) com testes
-- [ ] Parte 1 — mensagens `CONFIG`, `FRAME`, `TOUCH` e lado Kotlin com os mesmos vetores
+- [x] **Parte 1 — Fundação**: protocolo v1 completo em C# — as 7 mensagens (`HELLO`, `CONFIG`, `FRAME`, `TOUCH`, `PING`, `PONG`, `KEYFRAME_REQ`) e o `MessageReader` — com 26 testes contra os vetores compartilhados
+- [ ] Parte 1 — lado Kotlin com os mesmos vetores (pronto no branch `android-app`, aguardando merge)
 - [ ] **Parte 2** — Monitor virtual (instalação do VDD e `DisplayManager`)
 - [ ] **Parte 3** — Vídeo ponta a ponta no Wi-Fi + descoberta mDNS + overlay de latência
 - [ ] **Parte 4** — Conexão por cabo USB (`adb reverse`)
@@ -71,6 +71,7 @@ dotnet test
 | Documento | Conteúdo |
 |---|---|
 | [`docs/protocol.md`](docs/protocol.md) | Especificação do protocolo v1 |
+| [`docs/protocol-vectors`](docs/protocol-vectors) | Bytes de referência que os testes C# e Kotlin precisam reproduzir |
 | [`docs/guia-do-codigo.md`](docs/guia-do-codigo.md) | Guia do código para quem não conhece C# |
 | [`docs/superpowers/specs`](docs/superpowers/specs) | Spec de design do projeto |
 | [`docs/superpowers/plans`](docs/superpowers/plans) | Planos de implementação |
@@ -78,6 +79,10 @@ dotnet test
 ## 🚫 Fora do escopo (por enquanto)
 
 Modo internet (WebRTC/relay), iOS, macOS/Linux, driver próprio assinado, cor 4:4:4, áudio e múltiplos celulares.
+
+## 🔒 Segurança
+
+O protocolo v1 ainda não tem autenticação nem criptografia: qualquer aparelho na mesma rede que alcance a porta TCP 38700 do PC pode se conectar. Por enquanto, use apenas em rede confiável (por exemplo, a rede de casa — não Wi-Fi público).
 
 ## 📄 Licença
 
