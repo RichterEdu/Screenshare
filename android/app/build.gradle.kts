@@ -53,3 +53,9 @@ dependencies {
     debugImplementation(libs.androidx.compose.ui.test.manifest)
     debugImplementation(libs.androidx.compose.ui.tooling)
 }
+
+// Os testes leem docs/protocol-vectors: mudar um vetor precisa invalidar o cache do Gradle.
+val protocolVectors = layout.projectDirectory.dir("../../docs/protocol-vectors")
+tasks.withType<Test>().configureEach {
+    inputs.dir(protocolVectors)
+}
