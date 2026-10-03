@@ -50,6 +50,7 @@ O formato dos bytes trocados entre os dois lados está em [`docs/protocol.md`](d
 
 - [x] **Parte 1 — Fundação**: solução .NET e protocolo v1 (`HELLO`, `PING`, `PONG`, `KEYFRAME_REQ`) com testes
 - [x] Parte 1 — mensagens `CONFIG`, `FRAME`, `TOUCH` e lado Kotlin (`android/`) com os mesmos vetores
+- [x] **App Android e host de desenvolvimento** — app Compose descobre o PC (mDNS) ou aceita IP, faz o handshake e mostra a latência real (PING/PONG); `ScreenShare.DevHost` é o stub do lado do PC (sem vídeo)
 - [ ] **Parte 2** — Monitor virtual (instalação do VDD e `DisplayManager`)
 - [ ] **Parte 3** — Vídeo ponta a ponta no Wi-Fi + descoberta mDNS + overlay de latência
 - [ ] **Parte 4** — Conexão por cabo USB (`adb reverse`)
@@ -64,6 +65,12 @@ Pré-requisitos: [.NET 10 SDK](https://dotnet.microsoft.com/download) (host) e [
 git clone https://github.com/RichterEdu/Screenshare.git
 cd Screenshare/host
 dotnet test
+```
+
+Para testar o app sem o host real, rode o host de desenvolvimento (libere a porta 38700 no Firewall do Windows se ele pedir) e abra o app no celular, na mesma rede Wi-Fi:
+
+```bash
+dotnet run --project host/ScreenShare.DevHost
 ```
 
 App Android (usa o JDK do Android Studio):
