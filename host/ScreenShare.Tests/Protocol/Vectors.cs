@@ -12,4 +12,7 @@ internal static class Vectors
             .Select(token => Convert.ToByte(token, 16))
             .ToArray();
     }
+
+    public static string Text(string name) =>
+        File.ReadAllText(Path.Combine(AppContext.BaseDirectory, "protocol-vectors", name)).Trim();
 }

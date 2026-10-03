@@ -1,0 +1,1 @@
+screenshare://pair?h=192.168.0.10&p=38700&fp=ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8&s=AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8&n=PC%20da%20Sala
