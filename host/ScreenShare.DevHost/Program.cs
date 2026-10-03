@@ -39,10 +39,20 @@ Console.WriteLine($"ScreenShare DevHost \"{Environment.MachineName}\": Wi-Fi (TL
 Console.WriteLine($"IPs anunciados: {(lanAddresses.Count > 0 ? string.Join(", ", lanAddresses) : "todos")}. Digital: {identity.Fingerprint}");
 Console.WriteLine("Comandos: p = parear celular, l = listar pareados, r <id> = remover, Ctrl+C = sair.");
 
+// Uma falha num comando (ex.: erro de disco ao remover um celular) não pode encerrar o laço: p/l/r continuam respondendo.
 _ = Task.Run(() =>
 {
     while (Console.ReadLine() is { } line)
-        HandleCommand(line.Trim());
+    {
+        try
+        {
+            HandleCommand(line.Trim());
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"Falha no comando: {ex.Message}");
+        }
+    }
 });
 
 await server.RunAsync(cts.Token);
@@ -67,15 +77,19 @@ void HandleCommand(string line)
 {
     if (line == "p")
     {
-        if (lanAddresses.Count == 0)
+        // Prefere IP de rede privada: um adaptador de VPN com gateway pode vir antes do da LAN e o celular não o alcança.
+        var pairingIp = LanAddressSelector.PickForPairing(lanAddresses);
+        if (pairingIp is null)
         {
             Console.WriteLine("Nenhum IP de rede local encontrado: conecte o PC ao Wi-Fi/rede para parear.");
             return;
         }
-        var uri = PairingUri.Build(lanAddresses[0].ToString(), server.WifiPort, identity.Fingerprint, pairing.Begin(), Environment.MachineName);
+        var uri = PairingUri.Build(pairingIp.ToString(), server.WifiPort, identity.Fingerprint, pairing.Begin(), Environment.MachineName);
         using var qr = new QRCodeGenerator().CreateQrCode(uri, QRCodeGenerator.ECCLevel.L);
         Console.WriteLine(new AsciiQRCode(qr).GetGraphicSmall());
         Console.WriteLine($"Escaneie no app (vale {PairingSession.Lifetime.TotalMinutes:0} minutos, uma vez): {uri}");
+        var others = lanAddresses.Where(ip => !ip.Equals(pairingIp)).ToList();
+        Console.WriteLine($"IP no QR: {pairingIp}{(others.Count > 0 ? $" (outros: {string.Join(", ", others)})" : "")}");
     }
     else if (line == "l")
     {
