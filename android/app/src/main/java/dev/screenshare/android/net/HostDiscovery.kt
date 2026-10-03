@@ -3,12 +3,20 @@ package dev.screenshare.android.net
 import android.content.Context
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
+import dev.screenshare.android.security.Fingerprint
+import dev.screenshare.android.security.PairedPc
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
 
-/** Um PC anunciando o serviço ScreenShare na rede local. */
-data class DiscoveredHost(val name: String, val address: HostAddress)
+/** Um PC anunciando o serviço ScreenShare na rede local. [mdnsId] é o TXT `fp` (16 hex da digital do PC). */
+data class DiscoveredHost(val name: String, val address: HostAddress, val mdnsId: String? = null)
+
+/** Com um PC pareado, só os anúncios dele (TXT `fp` igual); sem pareamento, nenhum (é preciso parear primeiro). */
+fun List<DiscoveredHost>.ofPairedPc(pc: PairedPc?): List<DiscoveredHost> {
+    val id = pc?.let { Fingerprint.mdnsId(it.fingerprint) } ?: return emptyList()
+    return filter { it.mdnsId == id }
+}
 
 /** Descobre hosts por mDNS (`_screenshare._tcp`) usando o NsdManager do Android. */
 class HostDiscovery(context: Context) {
@@ -35,7 +43,10 @@ class HostDiscovery(context: Context) {
                     val ip = info.host?.hostAddress
                     synchronized(lock) {
                         resolving = false
-                        if (ip != null) found[info.serviceName] = DiscoveredHost(info.serviceName, HostAddress(ip, info.port))
+                        if (ip != null) {
+                            val mdnsId = info.attributes["fp"]?.let { String(it, Charsets.UTF_8) }
+                            found[info.serviceName] = DiscoveredHost(info.serviceName, HostAddress(ip, info.port), mdnsId)
+                        }
                     }
                     publish()
                     resolveNext()

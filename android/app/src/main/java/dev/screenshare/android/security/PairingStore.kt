@@ -2,8 +2,10 @@ package dev.screenshare.android.security
 
 import android.content.Context
 import androidx.datastore.core.DataStore
+import androidx.datastore.core.handlers.ReplaceFileCorruptionHandler
 import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.emptyPreferences
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import java.util.Base64
@@ -25,7 +27,11 @@ interface TokenCipher {
     fun decrypt(sealed: ByteArray): ByteArray
 }
 
-val Context.pairingDataStore: DataStore<Preferences> by preferencesDataStore(name = "pairing")
+/** Arquivo corrompido vira "sem pareamento" em vez de fazer toda leitura e escrita falhar para sempre. */
+val Context.pairingDataStore: DataStore<Preferences> by preferencesDataStore(
+    name = "pairing",
+    corruptionHandler = ReplaceFileCorruptionHandler { emptyPreferences() },
+)
 
 /**
  * Guarda um único PC pareado. A chave vai cifrada ([TokenCipher]); se não der para decifrar
