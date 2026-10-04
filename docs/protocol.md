@@ -5,9 +5,9 @@ Conexões TCP entre o app Android (cliente) e o host Windows (servidor). Inteiro
 | Porta | Uso | Escuta em | Transporte |
 |---|---|---|---|
 | 38700 | Wi-Fi | todas as interfaces | TLS obrigatório, certificado autoassinado do PC fixado pelo celular no pareamento |
-| 38701 | USB (`adb reverse tcp:38701 tcp:38701`) | só `127.0.0.1` | TCP puro |
+| 38701 | USB (`adb reverse tcp:38701 tcp:38701`) | só `127.0.0.1` | TLS obrigatório, igual à 38700 |
 
-As mensagens são as mesmas nas duas portas; muda só o que vem antes do `HELLO` (ver Sequência). Detalhes do pareamento: `docs/superpowers/specs/2026-10-03-pareamento-autenticacao-design.md`.
+As mensagens e a sequência são as mesmas nas duas portas: TLS, depois `PAIR` ou `AUTH`, depois `HELLO` (ver Sequência). Detalhes do pareamento: `docs/superpowers/specs/2026-10-03-pareamento-autenticacao-design.md`.
 
 ## Quadro
 
@@ -21,17 +21,18 @@ As mensagens são as mesmas nas duas portas; muda só o que vem antes do `HELLO`
 
 ## Sequência
 
-- **Wi-Fi (38700), primeiro uso — pareamento pelo QR:** TLS → `PAIR` → `PAIRED` → `AUTH` → `HELLO` → `CONFIG`.
-- **Wi-Fi (38700), já pareado:** TLS → `AUTH` → `HELLO` → `CONFIG`.
-- **USB (38701):** `HELLO` → `CONFIG`.
+A sequência é a mesma na 38700 (Wi-Fi) e na 38701 (USB, com o QR conectando em `127.0.0.1:38701`):
 
-Depois do `AUTH` (e no USB), 10 s sem nenhuma mensagem do celular fecham a conexão (o app envia `PING` a cada segundo).
+- **Primeiro uso — pareamento pelo QR:** TLS → `PAIR` → `PAIRED` → `AUTH` → `HELLO` → `CONFIG`.
+- **Já pareado:** TLS → `AUTH` → `HELLO` → `CONFIG`.
+
+Depois do `AUTH`, 10 s sem nenhuma mensagem do celular fecham a conexão (o app envia `PING` a cada segundo).
 
 Depois do `CONFIG`: o PC envia `FRAME`s (o primeiro é keyframe) e, a qualquer momento, vêm `TOUCH`, `PING`/`PONG`, `KEYFRAME_REQ`.
 
 Regras:
-- Na 38700 a primeira mensagem tem de ser `PAIR` ou `AUTH`; depois de `PAIR`/`PAIRED` vem `AUTH`. Qualquer outra coisa → `DENIED(2)` e fechamento.
-- Na 38701 a primeira mensagem tem de ser `HELLO`; qualquer outra coisa fecha a conexão sem `DENIED`.
+- Nas duas portas (38700 e 38701) a primeira mensagem tem de ser `PAIR` ou `AUTH`; depois de `PAIR`/`PAIRED` vem `AUTH`. Qualquer outra coisa (inclusive `HELLO` direto) → `DENIED(2)` e fechamento.
+- TCP puro, sem TLS, não tem sessão em nenhuma das duas portas.
 - `HELLO` com `protocolVersion` ≠ 2 → `DENIED(3)` e fechamento.
 - Depois de `DENIED` o PC fecha a conexão.
 

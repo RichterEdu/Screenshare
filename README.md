@@ -50,7 +50,7 @@ O formato dos bytes trocados entre os dois lados está em [`docs/protocol.md`](d
 
 - [x] **Parte 1 — Fundação**: protocolo v1 completo — as 7 mensagens (`HELLO`, `CONFIG`, `FRAME`, `TOUCH`, `PING`, `PONG`, `KEYFRAME_REQ`) e o `MessageReader` — em C# e em Kotlin (`android/`), testados contra os mesmos vetores
 - [x] **App Android e host de desenvolvimento** — app Compose descobre o PC (mDNS) ou aceita IP, faz o handshake e mostra a latência real (PING/PONG); `ScreenShare.DevHost` é o stub do lado do PC (sem vídeo)
-- [x] **Pareamento e autenticação** — QR + TLS com certificado fixo no Wi-Fi (protocolo v2); USB direto em loopback
+- [x] **Pareamento e autenticação** — QR + TLS com certificado fixo, no Wi-Fi e no cabo USB (protocolo v2)
 - [ ] **Parte 2** — Monitor virtual (instalação do VDD e `DisplayManager`)
 - [ ] **Parte 3** — Vídeo ponta a ponta no Wi-Fi + descoberta mDNS + overlay de latência
 - [ ] **Parte 4** — Conexão por cabo USB (`adb reverse`)
@@ -73,7 +73,7 @@ Para testar o app sem o host real, rode o host de desenvolvimento (libere a port
 dotnet run --project host/ScreenShare.DevHost
 ```
 
-No console, digite `p` para mostrar o QR de pareamento e escaneie com o app (botão **Parear com PC (QR)**). `l` lista os celulares pareados e `r <id>` remove um. Pelo cabo USB, rode `adb reverse tcp:38701 tcp:38701` e use **Conectar por cabo USB** no app.
+No console, digite `p` para mostrar o QR de pareamento e escaneie com o app (botão **Parear pelo Wi-Fi (QR)** ou **Parear pelo cabo USB (QR)**). `l` lista os celulares pareados e `r <id>` remove um. Dá para parear de duas formas: pelo Wi-Fi (botão **Parear pelo Wi-Fi (QR)**) ou pelo cabo (rode `adb reverse tcp:38701 tcp:38701` e use **Parear pelo cabo USB (QR)**, com o mesmo QR). Depois de pareado, **Conectar por cabo USB** usa o cabo (com o `adb reverse` ativo) e **Parear de novo (QR)** refaz o pareamento. Sem pareamento, o botão do cabo não aparece.
 
 App Android (usa o JDK do Android Studio):
 
@@ -99,7 +99,7 @@ Modo internet (WebRTC/relay), iOS, macOS/Linux, driver próprio assinado, cor 4:
 ## 🔒 Segurança
 
 - **Wi-Fi:** o celular precisa ser **pareado** uma vez escaneando o QR que o PC mostra. Depois disso a conexão é criptografada (TLS) e o celular só aceita o certificado daquele PC; o PC só aceita celulares pareados e permite remover qualquer um.
-- **Cabo USB:** sem pareamento nem criptografia: o tráfego não passa pela rede e a porta do USB (38701) só aceita conexões do próprio PC.
+- **Cabo USB:** exige o mesmo pareamento e o mesmo TLS do Wi-Fi. O `adb reverse` abre `127.0.0.1:38701` dentro do celular para qualquer app, e um app pode ocupar essa porta antes dele para se passar pelo PC; por isso a porta 38701 (que escuta só em `127.0.0.1` do PC) recusa conexão sem TLS e sem chave de um celular pareado, e o celular só aceita o certificado do PC pareado.
 
 ## 📄 Licença
 
