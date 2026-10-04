@@ -35,7 +35,7 @@ public sealed class HostServer : IDisposable
     /// Silêncio máximo numa sessão, em qualquer porta (padrão 10 s). O app manda PING a cada segundo,
     /// então 10 s sem nada é conexão morta (celular sem Wi-Fi, fora de alcance) e não pode prender a porta.
     /// </param>
-    /// <param name="monitors">Monitor virtual por sessão (padrão: nenhum; o CONFIG leva a resolução do HELLO).</param>
+    /// <param name="monitors">Monitor virtual por sessão (padrão: nenhum; o CONFIG leva a resolução pedida pelo celular, já normalizada).</param>
     public HostServer(int wifiPort, int usbPort, HostIdentity identity, PairingSession pairing, DeviceRegistry devices,
         Action<string>? log = null, TimeSpan? handshakeTimeout = null, TimeSpan? idleTimeout = null,
         IVirtualMonitorManager? monitors = null)

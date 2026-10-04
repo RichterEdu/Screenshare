@@ -306,6 +306,7 @@ public sealed class HostServerTests : IAsyncLifetime
 
         Assert.Equal(new DeniedMessage(DeniedReason.IncompatibleVersion), await reader.ReadAsync(_cts.Token));
         await AssertClosedAsync(reader);
+        Assert.Equal(0, _monitors.Acquired); // versão errada: nenhum monitor é ligado
     }
 
     [Fact]

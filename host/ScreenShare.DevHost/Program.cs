@@ -3,11 +3,11 @@ using Makaretu.Dns;
 using QRCoder;
 using ScreenShare.Core.Security;
 using ScreenShare.DevHost;
-using ScreenShare.Display;
 
 // Host de desenvolvimento: Wi-Fi com TLS + pareamento por QR (porta 38700) e USB com TLS + pareamento, só em loopback (porta 38701).
 // Comandos no console: p = parear celular (mostra o QR), l = listar pareados, r <id> = remover, Ctrl+C = sair.
 // Modos de linha de comando (pedem administrador): install-driver, uninstall-driver, restart-driver.
+// Opção: --sem-monitor (não liga o monitor virtual nem mexe no driver).
 if (DriverCommands.IsDriverCommand(args)) return await DriverCommands.RunAsync(args);
 
 const int WifiPort = 38700;

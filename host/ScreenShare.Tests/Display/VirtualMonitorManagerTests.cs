@@ -221,6 +221,23 @@ public sealed class VirtualMonitorManagerTests : IDisposable
     }
 
     [Fact]
+    public async Task Restart_that_throws_still_settles_the_monitor()
+    {
+        var restart = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        _restarter = new FakeRestarter(() => restart.Task);
+        using var manager = Create();
+        manager.Acquire(2400, 1080, 420).Dispose();
+        _time.Advance(TimeSpan.FromSeconds(11));
+
+        _topology.Attached = true; // o processo elevado falhou de um jeito inesperado depois de o driver reiniciar
+        restart.SetException(new InvalidOperationException("falha inesperada"));
+        await manager.PendingRestart;
+
+        Assert.False(_topology.Attached);
+        Assert.Contains(_log, line => line.Contains("Falha ao reiniciar o driver"));
+    }
+
+    [Fact]
     public async Task Restart_finishing_with_nobody_connected_leaves_the_monitor_off()
     {
         var restart = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
