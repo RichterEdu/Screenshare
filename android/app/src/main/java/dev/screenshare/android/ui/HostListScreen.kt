@@ -75,6 +75,7 @@ fun HostListScreen(
                     Text("PC pareado: ${pairedPc.name}", style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
                     TextButton(onClick = onForget, enabled = !connecting) { Text("Esquecer") }
                 }
+                OutlinedButton(onClick = onPair, enabled = !connecting) { Text("Parear de novo (QR)") }
                 Text("Na rede", style = MaterialTheme.typography.titleSmall)
                 if (hosts.isEmpty()) {
                     Text(

@@ -283,6 +283,21 @@ class ConnectionTest {
         assertTrue("o PC recebeu dados: $received", received!!.isFailure || received!!.getOrNull() == null)
     }
 
+    @Test
+    fun serverThatNeverAnswersHelloFailsWithATimeoutMessageInPortuguese() = runBlocking {
+        val serverSide = serving { _, _ -> Thread.sleep(3_000) } // aceita e nunca responde (> handshakeTimeoutMs)
+        val connection = newConnection()
+
+        connection.connect(usb())
+        val state = connection.await { it is ConnectionState.Failed } as ConnectionState.Failed
+
+        assertEquals(
+            "O PC não respondeu a tempo. Se a conexão anterior caiu agora, espere uns 10 segundos e tente de novo.",
+            state.reason,
+        )
+        serverSide.await()
+    }
+
     private companion object {
         val SECRET = ByteArray(32) { it.toByte() }
         val TOKEN = ByteArray(32) { (0xA0 + it).toByte() }

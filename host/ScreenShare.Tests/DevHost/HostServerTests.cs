@@ -81,6 +81,12 @@ public sealed class HostServerTests : IAsyncLifetime
     }
 
     [Fact]
+    public void SanitizeStripsControlCharacters()
+    {
+        Assert.Equal("Pixel X", HostServer.Sanitize("Pixel \u001bX\r\n\t"));
+    }
+
+    [Fact]
     public async Task Pairing_then_auth_then_hello_gets_config()
     {
         var secret = _pairing.Begin();

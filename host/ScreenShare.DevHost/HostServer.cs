@@ -1,6 +1,7 @@
 using System.Net;
 using System.Net.Security;
 using System.Net.Sockets;
+using System.Security.Authentication;
 using ScreenShare.Core.Protocol;
 using ScreenShare.Core.Security;
 
@@ -101,7 +102,11 @@ public sealed class HostServer : IDisposable
         handshake.CancelAfter(_handshakeTimeout);
 
         await tls.AuthenticateAsServerAsync(
-            new SslServerAuthenticationOptions { ServerCertificate = _identity.Certificate }, handshake.Token);
+            new SslServerAuthenticationOptions
+            {
+                ServerCertificate = _identity.Certificate,
+                EnabledSslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13, // spec: TLS 1.2 ou superior
+            }, handshake.Token);
         var reader = new MessageReader(tls);
         var first = await reader.ReadAsync(handshake.Token);
 
@@ -113,7 +118,7 @@ public sealed class HostServer : IDisposable
                 return;
             }
             var (device, token) = _devices.Add(pair.DeviceName);
-            _log?.Invoke($"Aparelho pareado: {device.Name} (id {device.Id})");
+            _log?.Invoke($"Aparelho pareado: {Sanitize(device.Name)} (id {device.Id})");
             await SendAsync(tls, new PairedMessage(token), cancellationToken);
             first = await reader.ReadAsync(handshake.Token);
         }
@@ -125,7 +130,7 @@ public sealed class HostServer : IDisposable
             return;
         }
 
-        _log?.Invoke($"Autenticado: {known.Name} (id {known.Id})");
+        _log?.Invoke($"Autenticado: {Sanitize(known.Name)} (id {known.Id})");
         await ServeSessionAsync(tls, reader, cancellationToken);
     }
 
@@ -200,6 +205,9 @@ public sealed class HostServer : IDisposable
             // o DENIED já foi enviado; o cliente sumir ou demorar a fechar não importa
         }
     }
+
+    /// <summary>Remove caracteres de controle (ex.: sequências ESC) de um nome vindo do celular antes de ir para o console.</summary>
+    public static string Sanitize(string text) => string.Concat(text.Where(c => !char.IsControl(c)));
 
     public void Dispose()
     {

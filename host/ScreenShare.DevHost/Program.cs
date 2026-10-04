@@ -96,7 +96,7 @@ void HandleCommand(string line)
         var list = devices.Devices;
         Console.WriteLine(list.Count == 0
             ? "Nenhum celular pareado."
-            : string.Join(Environment.NewLine, list.Select(d => $"  {d.Id}  {d.Name}  (pareado em {d.PairedAt.ToLocalTime():g})")));
+            : string.Join(Environment.NewLine, list.Select(d => $"  {d.Id}  {HostServer.Sanitize(d.Name)}  (pareado em {d.PairedAt.ToLocalTime():g})")));
     }
     else if (line.StartsWith("r ", StringComparison.Ordinal))
     {

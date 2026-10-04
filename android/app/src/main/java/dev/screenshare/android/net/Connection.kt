@@ -21,6 +21,7 @@ import java.io.IOException
 import java.io.OutputStream
 import java.net.InetSocketAddress
 import java.net.Socket
+import java.net.SocketTimeoutException
 import java.security.cert.CertificateException
 import javax.net.ssl.SSLException
 import javax.net.ssl.SSLSocket
@@ -132,6 +133,8 @@ class Connection(
             }
 
             s.soTimeout = 0 // daqui em diante a leitura bloqueia até chegar um PONG ou a conexão cair
+            // disconnect() pode ter corrido com a leitura do CONFIG: não publicar Connected depois de Disconnected
+            if (!currentCoroutineContext().isActive) return
             _state.value = ConnectionState.Connected(config, rttMs = null)
             val pinger = scope.launch(Dispatchers.IO) {
                 while (isActive) {
@@ -192,6 +195,8 @@ class Connection(
     }
 
     private fun IOException.describe() = when {
+        this is SocketTimeoutException ->
+            "O PC não respondeu a tempo. Se a conexão anterior caiu agora, espere uns 10 segundos e tente de novo."
         this is ProtocolException -> "Resposta inválida do PC: $message"
         this is SSLException && causes().any { it is CertificateException } ->
             "Este não é o PC pareado (certificado diferente). Pareie de novo."
