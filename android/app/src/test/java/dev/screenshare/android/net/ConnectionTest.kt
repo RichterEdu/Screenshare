@@ -374,6 +374,25 @@ class ConnectionTest {
     }
 
     @Test
+    fun serverClosingDuringTlsHandshakeShowsCannotConnectMessage() = runBlocking {
+        // adb reverse ativo, mas o ScreenShare do PC fechado: o adbd aceita e fecha na hora.
+        val closer = java.net.ServerSocket(0, 1, java.net.InetAddress.getLoopbackAddress())
+        try {
+            val serverSide = scope.async { closer.accept().close() }
+            val connection = newConnection()
+
+            connection.connect(ConnectTarget.Usb(PairedPc("PC de teste", hostFingerprint, TOKEN, null), port = closer.localPort))
+            val state = connection.await { it is ConnectionState.Failed }
+            serverSide.await()
+
+            val reason = (state as ConnectionState.Failed).reason
+            assertTrue(reason, reason.startsWith("Não foi possível conectar ao PC."))
+        } finally {
+            closer.close()
+        }
+    }
+
+    @Test
     fun pairingOverUsbConnectsToLoopbackUsbPort() = runBlocking {
         val serverSide = servingTls { socket, reader ->
             assertEquals(PairMessage(SECRET, "Pixel 8"), reader.read())

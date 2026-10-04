@@ -17,11 +17,13 @@ import dev.screenshare.android.protocol.ProtocolException
 import dev.screenshare.android.protocol.VideoCodec
 import dev.screenshare.android.security.PairedPc
 import dev.screenshare.android.security.PinnedTrustManager
+import java.io.EOFException
 import java.io.IOException
 import java.io.OutputStream
 import java.net.ConnectException
 import java.net.InetSocketAddress
 import java.net.Socket
+import java.net.SocketException
 import java.net.SocketTimeoutException
 import java.security.cert.CertificateException
 import javax.net.ssl.SSLException
@@ -109,10 +111,17 @@ class Connection(
             val (host, port) = target.endpoint()
             raw.tcpNoDelay = true
             raw.connect(InetSocketAddress(host, port), handshakeTimeoutMs)
-            val s = when (target) {
-                is ConnectTarget.Usb -> raw.upgradeToTls(host, port, target.pc.fingerprint)
-                is ConnectTarget.Wifi -> raw.upgradeToTls(host, port, target.pc.fingerprint)
-                is ConnectTarget.Pairing -> raw.upgradeToTls(host, port, target.info.fingerprint)
+            val fingerprint = when (target) {
+                is ConnectTarget.Usb -> target.pc.fingerprint
+                is ConnectTarget.Wifi -> target.pc.fingerprint
+                is ConnectTarget.Pairing -> target.info.fingerprint
+            }
+            val s = try {
+                raw.upgradeToTls(host, port, fingerprint)
+            } catch (e: IOException) {
+                // Com o adb reverse ativo e o ScreenShare fechado no PC, o adbd aceita e fecha na hora: o TLS acaba
+                // em EOF/reset, o mesmo que "ninguém escutando". O erro de certificado não passa por aqui.
+                if (e.closedByPeerDuringHandshake()) throw ConnectException(e.message) else throw e
             }
             s.soTimeout = handshakeTimeoutMs
             val out = s.getOutputStream()
@@ -221,6 +230,12 @@ class Connection(
 
     private companion object {
         const val LOOPBACK = "127.0.0.1"
+    }
+
+    private fun IOException.closedByPeerDuringHandshake(): Boolean {
+        if (causes().any { it is CertificateException || it is SocketTimeoutException }) return false
+        return causes().any { it is EOFException || it is SocketException } ||
+            (this is SSLException && message?.contains("terminated the handshake", ignoreCase = true) == true)
     }
 
     private fun Throwable.causes() = generateSequence(this) { it.cause }

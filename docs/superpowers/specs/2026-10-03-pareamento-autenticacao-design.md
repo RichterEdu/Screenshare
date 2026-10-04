@@ -73,15 +73,15 @@ Regras:
   - `PairingSession` — segredo, validade, uso único, comparação em tempo constante.
   - `DeviceRegistry` — adicionar, autenticar por chave (hash + tempo constante), listar, remover; persistência em JSON.
   - `PairingUri` — monta a URI do QR.
-- `ScreenShare.DevHost`: dois listeners (TLS na 38700 com `SslStream`, TCP puro na 38701 em loopback), fluxo PAIR/AUTH, comando de console para gerar o QR (QR em texto no terminal) e para listar/remover aparelhos; TXT do mDNS com `fp`.
+- `ScreenShare.DevHost`: dois listeners (TLS na 38700 com `SslStream`, TCP puro na 38701 em loopback), fluxo PAIR/AUTH, comando de console para gerar o QR (QR em texto no terminal) e para listar/remover aparelhos; TXT do mDNS com `fp`. *(Substituído: ver Revisão: USB autenticado.)*
 
 **Android (Kotlin)**
 - `protocol`: as 4 mensagens novas e `PROTOCOL_VERSION = 2`.
 - `security/PinnedTrustManager` — aceita só o certificado cuja digital SHA-256 é a esperada.
 - `security/PairingStore` — salva/lê/apaga o PC pareado (DataStore + Keystore).
 - `pairing/PairingUri` — interpreta a URI do QR.
-- `net/Connection` — modo Wi-Fi (TLS + `AUTH`, ou `PAIR` antes no primeiro uso) e modo USB (`127.0.0.1:38701`, sem TLS); estados novos para "não pareado" e "pareamento recusado".
-- UI: botão "Parear com PC" (abre o leitor de QR), lista de descoberta filtrando pelo `fp` do PC pareado.
+- `net/Connection` — modo Wi-Fi (TLS + `AUTH`, ou `PAIR` antes no primeiro uso) e modo USB (`127.0.0.1:38701`, sem TLS); estados novos para "não pareado" e "pareamento recusado". *(Substituído: ver Revisão: USB autenticado.)*
+- UI: botão "Parear com PC" (abre o leitor de QR), lista de descoberta filtrando pelo `fp` do PC pareado. *(Substituído: os botões agora são "Parear pelo Wi-Fi (QR)" e "Parear pelo cabo USB (QR)"; ver Revisão: USB autenticado.)*
 
 ## Erros
 
@@ -97,7 +97,7 @@ Regras:
 - **C# unitários:** `PairingSession` (segredo certo, errado, expirado, reutilizado, sessão substituída); `DeviceRegistry` (autenticar, remover, persistir e recarregar, JSON corrompido); `HostIdentity` (gera uma vez e recarrega a mesma digital); `PairingUri`.
 - **C# integração:** `SslStream` cliente contra o `HostServer` real — pareamento completo, reconexão com a chave, chave removida → `DENIED(2)`, porta 38700 sem `AUTH` → recusa, porta 38701 só em loopback.
 - **Kotlin unitários:** `PairingUri` (válida, campos faltando, base64 inválido); `PinnedTrustManager` (aceita a digital certa, recusa outra).
-- **Manual:** escanear o QR no celular, reconectar após reiniciar o app, remover o aparelho no PC e ver "Pareie de novo", conectar por USB sem pareamento.
+- **Manual:** escanear o QR no celular, reconectar após reiniciar o app, remover o aparelho no PC e ver "Pareie de novo", conectar por USB sem pareamento. *(Substituído: USB sem pareamento pede pareamento; parear pelo cabo funciona. Ver Revisão: USB autenticado.)*
 
 ## Fora de escopo
 

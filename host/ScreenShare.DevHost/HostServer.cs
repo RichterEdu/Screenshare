@@ -181,15 +181,7 @@ public sealed class HostServer : IDisposable
         drain.CancelAfter(DrainTimeout);
         try
         {
-            switch (stream)
-            {
-                case SslStream tls:
-                    await tls.ShutdownAsync();
-                    break;
-                case NetworkStream network:
-                    network.Socket.Shutdown(SocketShutdown.Send);
-                    break;
-            }
+            if (stream is SslStream tls) await tls.ShutdownAsync();
 
             var buffer = new byte[256];
             while (await stream.ReadAsync(buffer, drain.Token) > 0)
