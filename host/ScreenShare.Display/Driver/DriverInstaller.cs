@@ -52,13 +52,14 @@ public sealed class DriverInstaller(IDriverSystem system, Action<string> log, st
         {
             // Lê o catálogo antes de instalar: se ele não abrir, nada foi instalado ainda.
             var fromCatalog = system.CatalogThumbprints(Path.Combine(directory, VddPackage.CatalogRelativePath));
+            // O driver lê o XML assim que é instalado: o arquivo e as permissões têm de existir antes.
+            system.PrepareSettings(VddSettingsFile.DefaultPath, userSid);
             var trustedBefore = system.TrustedPublisherThumbprints();
             log("Instalando o driver (o Windows vai pedir confirmação) ...");
             var error = system.InstallDevice(Path.Combine(directory, VddPackage.InfRelativePath));
             ForgetPublisherTrustedByTheInstall(trustedBefore, fromCatalog);
             if (error != 0) return Failed(error);
 
-            system.PrepareSettings(VddSettingsFile.DefaultPath, userSid);
             log("Driver de monitor virtual instalado.");
             return DriverExitCode.Ok;
         }

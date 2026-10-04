@@ -56,6 +56,7 @@ public sealed class DriverInstallerTests
 
         Assert.Equal(Path.Combine(FakeDriverSystem.TempDirectory, @"VirtualDisplayDriver\MttVDD.inf"), _system.InstalledInf);
         Assert.Equal("S-1-5-21-1", _system.PreparedSid);
+        Assert.True(_system.SettingsPreparedBeforeInstall);
         Assert.True(_system.TempDeleted);
     }
 
@@ -85,7 +86,8 @@ public sealed class DriverInstallerTests
 
         Assert.Equal(DriverExitCode.UserDeclined, await Installer().InstallAsync("S-1-5-21-1"));
 
-        Assert.Null(_system.PreparedSid);
+        // O XML vem antes do driver; se a instalação é recusada, a pasta fica (uninstall-driver a apaga).
+        Assert.Equal("S-1-5-21-1", _system.PreparedSid);
         Assert.True(_system.TempDeleted);
         Assert.Equal(new[] { "SIGNPATH" }, _system.Removed);
         Assert.Contains(_log, line => line.Contains($"0x{error:X8}"));
@@ -117,6 +119,7 @@ public sealed class DriverInstallerTests
         await Assert.ThrowsAsync<CryptographicException>(() => Installer().InstallAsync("S-1-5-21-1"));
 
         Assert.Null(_system.InstalledInf);
+        Assert.Null(_system.PreparedSid);
         Assert.True(_system.TempDeleted);
     }
 
@@ -187,6 +190,7 @@ public sealed class DriverInstallerTests
         public List<string> Removed { get; } = [];
         public bool Downloaded { get; private set; }
         public bool CatalogReadBeforeInstall { get; private set; }
+        public bool SettingsPreparedBeforeInstall { get; private set; }
         public string? ExtractedTo { get; private set; }
         public bool TempDeleted { get; private set; }
         public string? InstalledInf { get; private set; }
@@ -238,6 +242,7 @@ public sealed class DriverInstallerTests
         {
             PreparedPath = settingsPath;
             PreparedSid = userSid;
+            SettingsPreparedBeforeInstall = InstalledInf is null;
         }
 
         public int UninstallDevices()
