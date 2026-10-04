@@ -57,7 +57,7 @@ Projeto novo: **`host/ScreenShare.Display`** (`net10.0-windows`). O `ScreenShare
 | `VirtualMonitor` | `record(string DeviceName, int X, int Y, int Width, int Height, int ScalePercent)`: o que a captura (Parte 3) e o toque (Parte 5) consomem. |
 | `IDriverSystem` / `WindowsDriverSystem` | As operações do Windows para instalar: detectar o dispositivo, baixar, extrair, certificados de `TrustedPublisher`, criar o dispositivo e instalar o `.inf` (SetupAPI), preparar o XML e as permissões, remover, reiniciar (`pnputil /restart-device`). |
 | `DriverInstaller` | A sequência de instalação, desinstalação e reinício sobre um `IDriverSystem`, com os códigos de saída. |
-| `ElevatedCommand` | Reabre o próprio executável como administrador (`runas`) e devolve o código de saída; UAC recusado = 5. |
+| `ElevatedCommand` | Reabre o próprio executável como administrador (`runas`) e devolve o código de saída; UAC recusado = 5; qualquer outra falha = 4, sem lançar. Não reabre o `dotnet.exe` (rodando como `dotnet ScreenShare.DevHost.dll`): só o executável do host. |
 
 ### DevHost
 
@@ -111,11 +111,12 @@ Projeto novo: **`host/ScreenShare.Display`** (`net10.0-windows`). O `ScreenShare
 
 ## Instalação (`install-driver`, como administrador)
 
-1. Se o dispositivo `Root\MttVDD` já existe, só prepara o XML e as permissões (passo 6) e sai com 0.
+1. Se já existe um dispositivo `Root\MttVDD` **com driver**, só prepara o XML e as permissões (passo 6) e sai com 0. Um dispositivo que ficou sem driver (instalação interrompida) não conta.
 2. Baixa o zip por HTTPS e confere o SHA-256 fixado. Se não bater, aborta sem instalar nada (código 2).
 3. Extrai numa pasta temporária.
-4. Anota as impressões dos certificados em `TrustedPublisher` (máquina).
+4. Lê os certificados do `mttvdd.cat` (antes de instalar: se o catálogo não abrir, nada foi instalado) e anota as impressões dos certificados em `TrustedPublisher` (máquina).
 5. **Instala o driver:**
+   - remove dispositivos `Root\MttVDD` que tenham ficado sem driver (senão o driver seria ligado aos dois e haveria dois adaptadores);
    - cria o dispositivo `Root\MttVDD` (SetupAPI: `SetupDiCreateDeviceInfoList`, `SetupDiCreateDeviceInfoW` com `DICD_GENERATE_ID`, `SetupDiSetDeviceRegistryPropertyW(SPDRP_HARDWAREID)` e `SetupDiCallClassInstaller(DIF_REGISTERDEVICE)`);
    - instala com `UpdateDriverForPlugAndPlayDevicesW`. O Windows mostra uma vez a confirmação "Deseja instalar este software de dispositivo?".
    - Se a instalação falhar, o dispositivo recém-criado é removido.
@@ -140,7 +141,7 @@ Códigos de saída:
 
 Sem driver instalado, sai com 0.
 
-**Reinício (`restart-driver`):** `%SystemRoot%\System32\pnputil.exe /restart-device <ID da instância>` para cada dispositivo `Root\MttVDD` presente. Código diferente de 0 → 4.
+**Reinício (`restart-driver`):** `%SystemRoot%\System32\pnputil.exe /restart-device <ID da instância>` para cada dispositivo `Root\MttVDD` presente. Sem nenhum dispositivo, é erro (`0xE000020B`, "não existe"), não sucesso. Código diferente de 0 → 4.
 
 ## Erros em tempo de uso
 
