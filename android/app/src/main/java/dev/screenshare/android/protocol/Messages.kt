@@ -11,6 +11,10 @@ object MessageType {
     const val PING = 5
     const val PONG = 6
     const val KEYFRAME_REQUEST = 7
+    const val PAIR = 8
+    const val PAIRED = 9
+    const val AUTH = 10
+    const val DENIED = 11
 }
 
 /** Flags de codec: o HELLO carrega uma combinação; o CONFIG, exatamente um. */
@@ -74,3 +78,38 @@ data class PongMessage(val timestampUs: Long) : Message
 
 /** Celular → PC: pede um keyframe após erro de decodificação. */
 data object KeyframeRequestMessage : Message
+
+/** Motivo de um DENIED. */
+enum class DeniedReason(val code: Int) {
+    /** Segredo de pareamento inválido, expirado ou já usado. */
+    INVALID_PAIRING_SECRET(1),
+
+    /** Chave de acesso desconhecida: nunca pareado ou removido no PC. */
+    UNKNOWN_DEVICE(2),
+
+    /** HELLO com protocolVersion diferente da do PC. */
+    INCOMPATIBLE_VERSION(3),
+}
+
+/** Celular → PC, só no Wi-Fi: primeiro contato vindo do QR. secret tem 32 bytes. */
+data class PairMessage(val secret: ByteArray, val deviceName: String) : Message {
+    override fun equals(other: Any?) =
+        other is PairMessage && secret.contentEquals(other.secret) && deviceName == other.deviceName
+
+    override fun hashCode() = Objects.hash(secret.contentHashCode(), deviceName)
+}
+
+/** PC → celular: chave de acesso (32 bytes) gerada no pareamento. */
+data class PairedMessage(val token: ByteArray) : Message {
+    override fun equals(other: Any?) = other is PairedMessage && token.contentEquals(other.token)
+    override fun hashCode() = token.contentHashCode()
+}
+
+/** Celular → PC, só no Wi-Fi: apresenta a chave de acesso antes do HELLO. */
+data class AuthMessage(val token: ByteArray) : Message {
+    override fun equals(other: Any?) = other is AuthMessage && token.contentEquals(other.token)
+    override fun hashCode() = token.contentHashCode()
+}
+
+/** PC → celular: recusa; o PC fecha a conexão em seguida. */
+data class DeniedMessage(val reason: DeniedReason) : Message

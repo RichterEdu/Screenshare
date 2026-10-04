@@ -12,7 +12,7 @@ public class MessageCodecTests
     public void Hello_matches_vector()
     {
         var vector = Vectors.Load("hello.hex");
-        var hello = new HelloMessage(1, 2400, 1080, 420, VideoCodec.H264 | VideoCodec.H265);
+        var hello = new HelloMessage(2, 2400, 1080, 420, VideoCodec.H264 | VideoCodec.H265);
 
         Assert.Equal(vector, MessageCodec.Encode(hello));
         Assert.Equal(hello, DecodeVector(vector));
@@ -165,4 +165,81 @@ public class MessageCodecTests
     public void Encoding_codec_config_over_65535_bytes_is_rejected() =>
         Assert.Throws<ProtocolException>(() => MessageCodec.Encode(
             new ConfigMessage(1920, 1080, VideoCodec.H264, 8000, new byte[70_000])));
+
+    private static readonly byte[] Secret00To1F = Enumerable.Range(0x00, 32).Select(i => (byte)i).ToArray();
+    private static readonly byte[] TokenA0ToBF = Enumerable.Range(0xA0, 32).Select(i => (byte)i).ToArray();
+
+    [Fact]
+    public void Pair_matches_vector()
+    {
+        var vector = Vectors.Load("pair.hex");
+        var pair = new PairMessage(Secret00To1F, "Pixel 8");
+
+        Assert.Equal(vector, MessageCodec.Encode(pair));
+        var decoded = Assert.IsType<PairMessage>(DecodeVector(vector));
+        Assert.Equal(pair with { Secret = decoded.Secret }, decoded);
+        Assert.Equal(Secret00To1F, decoded.Secret);
+    }
+
+    [Fact]
+    public void Paired_matches_vector()
+    {
+        var vector = Vectors.Load("paired.hex");
+
+        Assert.Equal(vector, MessageCodec.Encode(new PairedMessage(TokenA0ToBF)));
+        Assert.Equal(TokenA0ToBF, Assert.IsType<PairedMessage>(DecodeVector(vector)).Token);
+    }
+
+    [Fact]
+    public void Auth_matches_vector()
+    {
+        var vector = Vectors.Load("auth.hex");
+
+        Assert.Equal(vector, MessageCodec.Encode(new AuthMessage(TokenA0ToBF)));
+        Assert.Equal(TokenA0ToBF, Assert.IsType<AuthMessage>(DecodeVector(vector)).Token);
+    }
+
+    [Fact]
+    public void Denied_matches_vector()
+    {
+        var vector = Vectors.Load("denied.hex");
+        var denied = new DeniedMessage(DeniedReason.UnknownDevice);
+
+        Assert.Equal(vector, MessageCodec.Encode(denied));
+        Assert.Equal(denied, DecodeVector(vector));
+    }
+
+    [Fact]
+    public void Pair_with_empty_device_name_is_rejected()
+    {
+        var payload = new byte[32 + 1]; // segredo zerado + deviceNameLength=0
+        Assert.Throws<ProtocolException>(() => MessageCodec.Decode((byte)MessageType.Pair, payload));
+    }
+
+    [Fact]
+    public void Pair_with_invalid_utf8_device_name_is_rejected()
+    {
+        var payload = new byte[32 + 1 + 1];
+        payload[32] = 1;    // deviceNameLength=1
+        payload[33] = 0xFF; // byte que nunca aparece em UTF-8
+        Assert.Throws<ProtocolException>(() => MessageCodec.Decode((byte)MessageType.Pair, payload));
+    }
+
+    [Fact]
+    public void Encoding_device_name_over_64_bytes_is_rejected() =>
+        Assert.Throws<ProtocolException>(() => MessageCodec.Encode(new PairMessage(Secret00To1F, new string('a', 65))));
+
+    [Fact]
+    public void Encoding_auth_with_wrong_token_length_is_rejected() =>
+        Assert.Throws<ProtocolException>(() => MessageCodec.Encode(new AuthMessage(new byte[31])));
+
+    [Fact]
+    public void Auth_with_short_token_is_rejected() =>
+        Assert.Throws<ProtocolException>(() => MessageCodec.Decode((byte)MessageType.Auth, new byte[31]));
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(4)]
+    public void Denied_with_unknown_reason_is_rejected(byte reason) =>
+        Assert.Throws<ProtocolException>(() => MessageCodec.Decode((byte)MessageType.Denied, [reason]));
 }

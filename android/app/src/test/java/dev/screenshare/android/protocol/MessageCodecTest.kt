@@ -22,7 +22,7 @@ class MessageCodecTest {
     }
 
     @Test
-    fun hello() = assertMatchesVector("hello.hex", HelloMessage(1, 2400, 1080, 420, VideoCodec.H264 or VideoCodec.H265))
+    fun hello() = assertMatchesVector("hello.hex", HelloMessage(2, 2400, 1080, 420, VideoCodec.H264 or VideoCodec.H265))
 
     @Test
     fun config() = assertMatchesVector(
@@ -52,6 +52,46 @@ class MessageCodecTest {
 
     @Test
     fun pong() = assertMatchesVector("pong.hex", PongMessage(123456789))
+
+    private val secret = ByteArray(32) { it.toByte() }
+    private val token = ByteArray(32) { (0xA0 + it).toByte() }
+
+    @Test
+    fun pair() = assertMatchesVector("pair.hex", PairMessage(secret, "Pixel 8"))
+
+    @Test
+    fun paired() = assertMatchesVector("paired.hex", PairedMessage(token))
+
+    @Test
+    fun auth() = assertMatchesVector("auth.hex", AuthMessage(token))
+
+    @Test
+    fun denied() = assertMatchesVector("denied.hex", DeniedMessage(DeniedReason.UNKNOWN_DEVICE))
+
+    @Test
+    fun pairWithEmptyDeviceNameIsRejected() = assertRejected(MessageType.PAIR, ByteArray(32 + 1))
+
+    @Test
+    fun pairWithInvalidUtf8DeviceNameIsRejected() =
+        assertRejected(MessageType.PAIR, ByteArray(32 + 2).also { it[32] = 1; it[33] = 0xFF.toByte() })
+
+    @Test
+    fun encodingDeviceNameOver64BytesIsRejected() {
+        assertThrows(ProtocolException::class.java) { MessageCodec.encode(PairMessage(secret, "a".repeat(65))) }
+    }
+
+    @Test
+    fun encodingAuthWithWrongTokenLengthIsRejected() {
+        assertThrows(ProtocolException::class.java) { MessageCodec.encode(AuthMessage(ByteArray(31))) }
+    }
+
+    @Test
+    fun authWithShortTokenIsRejected() = assertRejected(MessageType.AUTH, ByteArray(31))
+
+    @Test
+    fun deniedWithUnknownReasonIsRejected() {
+        for (reason in listOf(0, 4)) assertRejected(MessageType.DENIED, byteArrayOf(reason.toByte()))
+    }
 
     @Test
     fun keyframeRequest() = assertMatchesVector("keyframe_req.hex", KeyframeRequestMessage)

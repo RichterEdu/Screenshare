@@ -14,7 +14,7 @@ class MessageReaderTest {
         val bytes = Vectors.load("hello.hex") + Vectors.load("ping.hex") + Vectors.load("keyframe_req.hex")
         val reader = MessageReader(ByteArrayInputStream(bytes))
 
-        assertEquals(HelloMessage(1, 2400, 1080, 420, VideoCodec.ALL), reader.read())
+        assertEquals(HelloMessage(2, 2400, 1080, 420, VideoCodec.ALL), reader.read())
         assertEquals(PingMessage(123456789), reader.read())
         assertEquals(KeyframeRequestMessage, reader.read())
         assertNull(reader.read())

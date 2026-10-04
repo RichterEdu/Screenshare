@@ -33,4 +33,19 @@ public static class LanAddressSelector
             .SelectMany(a => a.Addresses)
             .Where(ip => ip.AddressFamily == AddressFamily.InterNetwork)
             .ToList();
+
+    /// <summary>
+    /// Escolhe o IP que vai no QR de pareamento: o primeiro IPv4 de rede privada (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16),
+    /// que é o que um celular na mesma rede alcança; sem nenhum, o primeiro da lista; lista vazia, null.
+    /// Não depende da ordem dos adaptadores (um adaptador de VPN com gateway pode vir antes do da LAN).
+    /// </summary>
+    public static IPAddress? PickForPairing(IReadOnlyList<IPAddress> addresses) =>
+        addresses.FirstOrDefault(IsPrivateIPv4) ?? addresses.FirstOrDefault();
+
+    private static bool IsPrivateIPv4(IPAddress ip)
+    {
+        if (ip.AddressFamily != AddressFamily.InterNetwork) return false;
+        var b = ip.GetAddressBytes();
+        return b[0] == 10 || (b[0] == 172 && b[1] is >= 16 and <= 31) || (b[0] == 192 && b[1] == 168);
+    }
 }

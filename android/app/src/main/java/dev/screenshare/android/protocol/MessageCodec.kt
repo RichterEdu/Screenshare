@@ -2,16 +2,22 @@ package dev.screenshare.android.protocol
 
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.nio.CharBuffer
+import java.nio.charset.CharacterCodingException
+import java.nio.charset.CodingErrorAction
 
 /**
  * Converte mensagens de/para quadros [type:u8][payloadLength:u32 LE][payload].
  * Layouts em docs/protocol.md; bytes de referência em docs/protocol-vectors.
  */
 object MessageCodec {
-    const val PROTOCOL_VERSION = 1
+    const val PROTOCOL_VERSION = 2
     const val HEADER_SIZE = 5
     const val MAX_PAYLOAD_LENGTH = 16 * 1024 * 1024
     const val MAX_TOUCH_POINTERS = 10
+    const val SECRET_LENGTH = 32
+    const val TOKEN_LENGTH = 32
+    const val MAX_DEVICE_NAME_BYTES = 64
 
     private const val TOUCH_POINTER_SIZE = 14
 
@@ -56,6 +62,24 @@ object MessageCodec {
                 }
             }
         }
+        is PairMessage -> {
+            requireLength(message.secret, SECRET_LENGTH, "segredo")
+            val name = encodeDeviceName(message.deviceName)
+            frame(MessageType.PAIR, SECRET_LENGTH + 1 + name.size) {
+                put(message.secret)
+                put(name.size.toByte())
+                put(name)
+            }
+        }
+        is PairedMessage -> {
+            requireLength(message.token, TOKEN_LENGTH, "chave")
+            frame(MessageType.PAIRED, TOKEN_LENGTH) { put(message.token) }
+        }
+        is AuthMessage -> {
+            requireLength(message.token, TOKEN_LENGTH, "chave")
+            frame(MessageType.AUTH, TOKEN_LENGTH) { put(message.token) }
+        }
+        is DeniedMessage -> frame(MessageType.DENIED, 1) { put(message.reason.code.toByte()) }
         is PingMessage -> frame(MessageType.PING, 8) { putLong(message.timestampUs) }
         is PongMessage -> frame(MessageType.PONG, 8) { putLong(message.timestampUs) }
         KeyframeRequestMessage -> frame(MessageType.KEYFRAME_REQUEST, 0) {}
@@ -68,6 +92,10 @@ object MessageCodec {
             MessageType.CONFIG -> decodeConfig(r)
             MessageType.FRAME -> decodeFrame(r)
             MessageType.TOUCH -> decodeTouch(r)
+            MessageType.PAIR -> decodePair(r)
+            MessageType.PAIRED -> PairedMessage(r.bytes(TOKEN_LENGTH))
+            MessageType.AUTH -> AuthMessage(r.bytes(TOKEN_LENGTH))
+            MessageType.DENIED -> decodeDenied(r)
             MessageType.PING -> PingMessage(r.u64())
             MessageType.PONG -> PongMessage(r.u64())
             MessageType.KEYFRAME_REQUEST -> KeyframeRequestMessage
@@ -136,5 +164,50 @@ object MessageCodec {
             TouchPointer(id, action, x, y, pressure)
         }
         return TouchMessage(pointers)
+    }
+
+    private fun requireLength(value: ByteArray, length: Int, what: String) {
+        if (value.size != length) throw ProtocolException("o $what precisa ter $length bytes, tem ${value.size}")
+    }
+
+    private fun encodeDeviceName(name: String): ByteArray {
+        val buffer = try {
+            Charsets.UTF_8.newEncoder()
+                .onMalformedInput(CodingErrorAction.REPORT)
+                .onUnmappableCharacter(CodingErrorAction.REPORT)
+                .encode(CharBuffer.wrap(name))
+        } catch (e: CharacterCodingException) {
+            throw ProtocolException("nome do aparelho não é texto válido")
+        }
+        val bytes = ByteArray(buffer.remaining()).also { buffer.get(it) }
+        if (bytes.size !in 1..MAX_DEVICE_NAME_BYTES) {
+            throw ProtocolException("nome do aparelho precisa ter 1..$MAX_DEVICE_NAME_BYTES bytes, tem ${bytes.size}")
+        }
+        return bytes
+    }
+
+    private fun decodePair(r: PayloadReader): PairMessage {
+        val secret = r.bytes(SECRET_LENGTH)
+        val nameLength = r.u8()
+        if (nameLength !in 1..MAX_DEVICE_NAME_BYTES) {
+            throw ProtocolException("nome do aparelho precisa ter 1..$MAX_DEVICE_NAME_BYTES bytes, tem $nameLength")
+        }
+        val name = try {
+            Charsets.UTF_8.newDecoder()
+                .onMalformedInput(CodingErrorAction.REPORT)
+                .onUnmappableCharacter(CodingErrorAction.REPORT)
+                .decode(ByteBuffer.wrap(r.bytes(nameLength)))
+                .toString()
+        } catch (e: CharacterCodingException) {
+            throw ProtocolException("nome do aparelho não é UTF-8 válido")
+        }
+        return PairMessage(secret, name)
+    }
+
+    private fun decodeDenied(r: PayloadReader): DeniedMessage {
+        val code = r.u8()
+        val reason = DeniedReason.entries.firstOrNull { it.code == code }
+            ?: throw ProtocolException("motivo de DENIED desconhecido: $code")
+        return DeniedMessage(reason)
     }
 }

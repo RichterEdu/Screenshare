@@ -1,6 +1,13 @@
-# Protocolo ScreenShare — versão 1
+# Protocolo ScreenShare — versão 2
 
-Uma conexão TCP entre o app Android (cliente) e o host Windows (servidor), porta padrão **38700**. Wi-Fi e USB (`adb reverse`) usam exatamente o mesmo protocolo. Inteiros são **little-endian**; `f32` é IEEE 754 de 32 bits little-endian.
+Conexões TCP entre o app Android (cliente) e o host Windows (servidor). Inteiros são **little-endian**; `f32` é IEEE 754 de 32 bits little-endian.
+
+| Porta | Uso | Escuta em | Transporte |
+|---|---|---|---|
+| 38700 | Wi-Fi | todas as interfaces | TLS obrigatório, certificado autoassinado do PC fixado pelo celular no pareamento |
+| 38701 | USB (`adb reverse tcp:38701 tcp:38701`) | só `127.0.0.1` | TCP puro |
+
+As mensagens são as mesmas nas duas portas; muda só o que vem antes do `HELLO` (ver Sequência). Detalhes do pareamento: `docs/superpowers/specs/2026-10-03-pareamento-autenticacao-design.md`.
 
 ## Quadro
 
@@ -14,10 +21,19 @@ Uma conexão TCP entre o app Android (cliente) e o host Windows (servidor), port
 
 ## Sequência
 
-1. O celular conecta e envia `HELLO`.
-2. O PC responde `CONFIG`, ou fecha a conexão se `protocolVersion` for incompatível.
-3. O PC envia `FRAME`s; o primeiro é keyframe.
-4. Depois do `CONFIG`, a qualquer momento: `TOUCH`, `PING`/`PONG`, `KEYFRAME_REQ`.
+- **Wi-Fi (38700), primeiro uso — pareamento pelo QR:** TLS → `PAIR` → `PAIRED` → `AUTH` → `HELLO` → `CONFIG`.
+- **Wi-Fi (38700), já pareado:** TLS → `AUTH` → `HELLO` → `CONFIG`.
+- **USB (38701):** `HELLO` → `CONFIG`.
+
+Depois do `AUTH` (e no USB), 10 s sem nenhuma mensagem do celular fecham a conexão (o app envia `PING` a cada segundo).
+
+Depois do `CONFIG`: o PC envia `FRAME`s (o primeiro é keyframe) e, a qualquer momento, vêm `TOUCH`, `PING`/`PONG`, `KEYFRAME_REQ`.
+
+Regras:
+- Na 38700 a primeira mensagem tem de ser `PAIR` ou `AUTH`; depois de `PAIR`/`PAIRED` vem `AUTH`. Qualquer outra coisa → `DENIED(2)` e fechamento.
+- Na 38701 a primeira mensagem tem de ser `HELLO`; qualquer outra coisa fecha a conexão sem `DENIED`.
+- `HELLO` com `protocolVersion` ≠ 2 → `DENIED(3)` e fechamento.
+- Depois de `DENIED` o PC fecha a conexão.
 
 ## Mensagens
 
@@ -30,11 +46,15 @@ Uma conexão TCP entre o app Android (cliente) e o host Windows (servidor), port
 | 5 | PING | qualquer lado | 8 |
 | 6 | PONG | resposta ao PING | 8 |
 | 7 | KEYFRAME_REQ | celular → PC | 0 |
+| 8 | PAIR | celular → PC | 33 + n |
+| 9 | PAIRED | PC → celular | 32 |
+| 10 | AUTH | celular → PC | 32 |
+| 11 | DENIED | PC → celular | 1 |
 
 ### HELLO
 | Campo | Tipo | Observação |
 |---|---|---|
-| protocolVersion | u16 | 1 |
+| protocolVersion | u16 | 2 (o layout de 9 bytes do HELLO é congelado em todas as versões) |
 | width | u16 | largura da tela do celular, em pixels |
 | height | u16 | altura, em pixels |
 | densityDpi | u16 | |
@@ -71,8 +91,30 @@ Cada ponteiro: `id` u8, `action` u8 (0 DOWN, 1 MOVE, 2 UP, 3 CANCEL), `x` f32, `
 ### KEYFRAME_REQ
 Sem payload. O celular pede um keyframe depois de um erro de decodificação.
 
+### PAIR
+| Campo | Tipo | Observação |
+|---|---|---|
+| secret | 32 bytes | segredo de pareamento lido do QR (válido por 2 minutos, uso único) |
+| deviceNameLength | u8 | 1 a 64 bytes UTF-8 (UTF-8 inválido é erro) |
+| deviceName | UTF-8 | nome do celular, mostrado no PC |
+
+### PAIRED
+| Campo | Tipo | Observação |
+|---|---|---|
+| token | 32 bytes | chave de acesso; o celular guarda, o PC guarda só o SHA-256 |
+
+### AUTH
+| Campo | Tipo | Observação |
+|---|---|---|
+| token | 32 bytes | chave de acesso recebida no PAIRED |
+
+### DENIED
+| Campo | Tipo | Observação |
+|---|---|---|
+| reason | u8 | 1 = segredo inválido, expirado ou usado; 2 = aparelho não pareado ou removido; 3 = versão incompatível |
+
 ## Descoberta (Wi-Fi)
-O host anuncia por mDNS/DNS-SD o serviço **`_screenshare._tcp`**, com a porta TCP do protocolo (padrão 38700) e o nome da máquina como nome da instância. O app Android o encontra com o `NsdManager`; se a rede bloquear multicast, o usuário digita `IP` ou `IP:porta`. No USB não há descoberta: o app conecta em `127.0.0.1` depois do `adb reverse`.
+O host anuncia por mDNS/DNS-SD o serviço **`_screenshare._tcp`**, com a porta TCP do protocolo (padrão 38700) e o nome da máquina como nome da instância. O app Android o encontra com o `NsdManager`; se a rede bloquear multicast, o usuário digita `IP` ou `IP:porta`. No USB não há descoberta: o app conecta em `127.0.0.1` depois do `adb reverse`. O TXT do anúncio traz `fp` = 16 primeiros caracteres hex (minúsculos) do SHA-256 do certificado do PC, para o celular reconhecer o PC pareado mesmo se o IP mudar. No USB a porta é a 38701.
 
 ## Validação
 - Payload com bytes faltando ou sobrando é erro; tipo desconhecido é erro.
@@ -80,14 +122,18 @@ O host anuncia por mDNS/DNS-SD o serviço **`_screenshare._tcp`**, com a porta T
 - Stream terminando no meio de uma mensagem: `EndOfStreamException` (C#) / `EOFException` (Kotlin). Terminando entre mensagens: desconexão normal (`null`).
 
 ## Vetores de teste
-`docs/protocol-vectors/*.hex` são quadros completos (cabeçalho + payload) em pares hexadecimais; `#` inicia comentário. As duas implementações devem gerar e aceitar exatamente esses bytes.
+`docs/protocol-vectors/*.hex` são quadros completos (cabeçalho + payload) em pares hexadecimais; `#` inicia comentário. As duas implementações devem gerar e aceitar exatamente esses bytes. `pairing-uri.txt` guarda a URI de exemplo do QR, compartilhada pelos testes C# e Kotlin.
 
 | Arquivo | Conteúdo |
 |---|---|
-| hello.hex | HELLO v1, 2400×1080, 420 dpi, H.264 + H.265 |
+| hello.hex | HELLO v2, 2400×1080, 420 dpi, H.264 + H.265 |
 | config.hex | CONFIG 2400×1080, H.265, 20 000 kbps, 8 bytes de codec config |
 | frame.hex | FRAME keyframe, t = 1 000 000 µs, 7 bytes de dados |
 | touch.hex | TOUCH com 2 ponteiros (MOVE e DOWN) |
 | ping.hex | PING t = 123 456 789 |
 | pong.hex | PONG t = 123 456 789 |
 | keyframe_req.hex | KEYFRAME_REQ |
+| pair.hex | PAIR com segredo 00..1F e aparelho "Pixel 8" |
+| paired.hex | PAIRED com chave A0..BF |
+| auth.hex | AUTH com chave A0..BF |
+| denied.hex | DENIED motivo 2 |

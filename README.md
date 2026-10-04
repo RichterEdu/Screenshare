@@ -50,6 +50,7 @@ O formato dos bytes trocados entre os dois lados está em [`docs/protocol.md`](d
 
 - [x] **Parte 1 — Fundação**: protocolo v1 completo — as 7 mensagens (`HELLO`, `CONFIG`, `FRAME`, `TOUCH`, `PING`, `PONG`, `KEYFRAME_REQ`) e o `MessageReader` — em C# e em Kotlin (`android/`), testados contra os mesmos vetores
 - [x] **App Android e host de desenvolvimento** — app Compose descobre o PC (mDNS) ou aceita IP, faz o handshake e mostra a latência real (PING/PONG); `ScreenShare.DevHost` é o stub do lado do PC (sem vídeo)
+- [x] **Pareamento e autenticação** — QR + TLS com certificado fixo no Wi-Fi (protocolo v2); USB direto em loopback
 - [ ] **Parte 2** — Monitor virtual (instalação do VDD e `DisplayManager`)
 - [ ] **Parte 3** — Vídeo ponta a ponta no Wi-Fi + descoberta mDNS + overlay de latência
 - [ ] **Parte 4** — Conexão por cabo USB (`adb reverse`)
@@ -66,11 +67,13 @@ cd Screenshare/host
 dotnet test
 ```
 
-Para testar o app sem o host real, rode o host de desenvolvimento (libere a porta 38700 no Firewall do Windows se ele pedir) e abra o app no celular, na mesma rede Wi-Fi:
+Para testar o app sem o host real, rode o host de desenvolvimento (libere a porta 38700 no Firewall do Windows se ele pedir):
 
 ```bash
 dotnet run --project host/ScreenShare.DevHost
 ```
+
+No console, digite `p` para mostrar o QR de pareamento e escaneie com o app (botão **Parear com PC (QR)**). `l` lista os celulares pareados e `r <id>` remove um. Pelo cabo USB, rode `adb reverse tcp:38701 tcp:38701` e use **Conectar por cabo USB** no app.
 
 App Android (usa o JDK do Android Studio):
 
@@ -83,7 +86,7 @@ $env:JAVA_HOME = 'C:\Program Files\Android\Android Studio\jbr'
 
 | Documento | Conteúdo |
 |---|---|
-| [`docs/protocol.md`](docs/protocol.md) | Especificação do protocolo v1 |
+| [`docs/protocol.md`](docs/protocol.md) | Especificação do protocolo v2 |
 | [`docs/protocol-vectors`](docs/protocol-vectors) | Bytes de referência que os testes C# e Kotlin precisam reproduzir |
 | [`docs/guia-do-codigo.md`](docs/guia-do-codigo.md) | Guia do código para quem não conhece C# |
 | [`docs/superpowers/specs`](docs/superpowers/specs) | Spec de design do projeto |
@@ -95,7 +98,8 @@ Modo internet (WebRTC/relay), iOS, macOS/Linux, driver próprio assinado, cor 4:
 
 ## 🔒 Segurança
 
-O protocolo v1 ainda não tem autenticação nem criptografia: qualquer aparelho na mesma rede que alcance a porta TCP 38700 do PC pode se conectar. Por enquanto, use apenas em rede confiável (por exemplo, a rede de casa — não Wi-Fi público).
+- **Wi-Fi:** o celular precisa ser **pareado** uma vez escaneando o QR que o PC mostra. Depois disso a conexão é criptografada (TLS) e o celular só aceita o certificado daquele PC; o PC só aceita celulares pareados e permite remover qualquer um.
+- **Cabo USB:** sem pareamento nem criptografia: o tráfego não passa pela rede e a porta do USB (38701) só aceita conexões do próprio PC.
 
 ## 📄 Licença
 

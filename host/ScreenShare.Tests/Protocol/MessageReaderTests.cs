@@ -13,7 +13,7 @@ public class MessageReaderTests
             .ToArray();
         var reader = new MessageReader(new MemoryStream(bytes));
 
-        Assert.Equal(new HelloMessage(1, 2400, 1080, 420, VideoCodec.H264 | VideoCodec.H265), await reader.ReadAsync());
+        Assert.Equal(new HelloMessage(2, 2400, 1080, 420, VideoCodec.H264 | VideoCodec.H265), await reader.ReadAsync());
         Assert.Equal(new PingMessage(123456789), await reader.ReadAsync());
         Assert.Equal(new KeyframeRequestMessage(), await reader.ReadAsync());
         Assert.Null(await reader.ReadAsync());

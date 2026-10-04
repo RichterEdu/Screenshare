@@ -26,6 +26,7 @@
   <ItemGroup>
     <!-- Vetores compartilhados com o Kotlin: copiados para bin/.../protocol-vectors -->
     <None Include="..\..\docs\protocol-vectors\*.hex" LinkBase="protocol-vectors" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\..\docs\protocol-vectors\*.txt" LinkBase="protocol-vectors" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
 </Project>

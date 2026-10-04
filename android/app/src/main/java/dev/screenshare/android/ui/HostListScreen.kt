@@ -15,9 +15,11 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -32,13 +34,20 @@ import dev.screenshare.android.net.ConnectionState
 import dev.screenshare.android.net.DEFAULT_PORT
 import dev.screenshare.android.net.DiscoveredHost
 import dev.screenshare.android.net.HostAddress
+import dev.screenshare.android.net.USB_PORT
 import dev.screenshare.android.net.parseHostAddress
+import dev.screenshare.android.security.PairedPc
 
 @Composable
 fun HostListScreen(
     hosts: List<DiscoveredHost>,
     state: ConnectionState,
+    pairedPc: PairedPc?,
+    message: String?,
+    onPair: () -> Unit,
     onConnect: (HostAddress) -> Unit,
+    onConnectUsb: () -> Unit,
+    onForget: () -> Unit,
 ) {
     val connecting = state is ConnectionState.Connecting
 
@@ -51,42 +60,58 @@ fun HostListScreen(
 
             when {
                 connecting -> LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
-                state is ConnectionState.Failed ->
-                    Text(state.reason, color = MaterialTheme.colorScheme.error)
+                state is ConnectionState.Failed -> Text(state.reason, color = MaterialTheme.colorScheme.error)
             }
+            message?.let { Text(it, color = MaterialTheme.colorScheme.error) }
 
-            Text("PCs na rede", style = MaterialTheme.typography.titleMedium)
-            if (hosts.isEmpty()) {
+            if (pairedPc == null) {
                 Text(
-                    "Procurando… Abra o ScreenShare no PC (mesma rede Wi-Fi) ou digite o endereço abaixo.",
+                    "Para usar pelo Wi-Fi, pareie com o PC: no ScreenShare do PC, peça para parear e escaneie o QR.",
                     style = MaterialTheme.typography.bodyMedium,
                 )
-            }
-            LazyColumn(
-                modifier = Modifier.weight(1f, fill = false),
-                verticalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                items(hosts, key = { it.name }) { host ->
-                    Card(
-                        modifier = Modifier.fillMaxWidth().clickable(enabled = !connecting) { onConnect(host.address) },
-                    ) {
-                        Column(modifier = Modifier.padding(16.dp)) {
-                            Text(host.name, style = MaterialTheme.typography.titleMedium)
-                            Text("${host.address.host}:${host.address.port}", style = MaterialTheme.typography.bodySmall)
+                Button(onClick = onPair, enabled = !connecting) { Text("Parear com PC (QR)") }
+            } else {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("PC pareado: ${pairedPc.name}", style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
+                    TextButton(onClick = onForget, enabled = !connecting) { Text("Esquecer") }
+                }
+                OutlinedButton(onClick = onPair, enabled = !connecting) { Text("Parear de novo (QR)") }
+                Text("Na rede", style = MaterialTheme.typography.titleSmall)
+                if (hosts.isEmpty()) {
+                    Text(
+                        "Procurando o PC… Abra o ScreenShare nele (mesma rede Wi-Fi) ou digite o endereço abaixo.",
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                }
+                LazyColumn(
+                    modifier = Modifier.weight(1f, fill = false),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    items(hosts, key = { it.name }) { host ->
+                        Card(modifier = Modifier.fillMaxWidth().clickable(enabled = !connecting) { onConnect(host.address) }) {
+                            Column(modifier = Modifier.padding(16.dp)) {
+                                Text(host.name, style = MaterialTheme.typography.titleMedium)
+                                Text("${host.address.host}:${host.address.port}", style = MaterialTheme.typography.bodySmall)
+                            }
                         }
                     }
                 }
+                ManualAddress(initial = pairedPc.lastHost.orEmpty(), enabled = !connecting, onConnect = onConnect)
             }
 
-            ManualAddress(enabled = !connecting, onConnect = onConnect)
+            OutlinedButton(onClick = onConnectUsb, enabled = !connecting) { Text("Conectar por cabo USB") }
+            Text(
+                "No cabo: ative a depuração USB e rode no PC: adb reverse tcp:$USB_PORT tcp:$USB_PORT",
+                style = MaterialTheme.typography.bodySmall,
+            )
         }
     }
 }
 
-/** Plano B quando o mDNS não funciona na rede: digitar o IP do PC. */
+/** Plano B quando o mDNS não funciona na rede: digitar o IP do PC pareado. */
 @Composable
-private fun ManualAddress(enabled: Boolean, onConnect: (HostAddress) -> Unit) {
-    var text by rememberSaveable { mutableStateOf("") }
+private fun ManualAddress(initial: String, enabled: Boolean, onConnect: (HostAddress) -> Unit) {
+    var text by rememberSaveable { mutableStateOf(initial) }
     val address = remember(text) { parseHostAddress(text) }
 
     Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
