@@ -249,8 +249,9 @@ public sealed class HostServerTests : IAsyncLifetime
             await plain.GetStream().WriteAsync(MessageCodec.Encode(Hello()), _cts.Token);
             Message? reply = null;
             var error = await Record.ExceptionAsync(async () => reply = await new MessageReader(plain.GetStream()).ReadAsync(_cts.Token));
-            Assert.Null(reply);
-            Assert.True(error is null or IOException, $"erro inesperado: {error}");
+            // o servidor só derruba depois do prazo de handshake (2 s no fixture); alerta TLS vira ProtocolException
+            Assert.True(reply is not (ConfigMessage or DeniedMessage), $"resposta inesperada: {reply}");
+            Assert.True(error is null or IOException or ProtocolException, $"erro inesperado: {error}");
         }
 
         // a porta continua servindo um cliente de verdade
@@ -270,6 +271,7 @@ public sealed class HostServerTests : IAsyncLifetime
 
         Assert.Equal(new DeniedMessage(DeniedReason.UnknownDevice), await reader.ReadAsync(_cts.Token));
         await AssertClosedAsync(reader);
+        Assert.Empty(_devices.Devices);
     }
 
     [Fact]
@@ -313,8 +315,9 @@ public sealed class HostServerTests : IAsyncLifetime
             await plain.GetStream().WriteAsync(MessageCodec.Encode(Hello(version: 1)), _cts.Token);
             Message? reply = null;
             var error = await Record.ExceptionAsync(async () => reply = await new MessageReader(plain.GetStream()).ReadAsync(_cts.Token));
-            Assert.Null(reply);
-            Assert.True(error is null or IOException, $"erro inesperado: {error}");
+            // o servidor só derruba depois do prazo de handshake (2 s no fixture); alerta TLS vira ProtocolException
+            Assert.True(reply is not (ConfigMessage or DeniedMessage), $"resposta inesperada: {reply}");
+            Assert.True(error is null or IOException or ProtocolException, $"erro inesperado: {error}");
         }
 
         var (_, token) = _devices.Add("Pixel 8");
