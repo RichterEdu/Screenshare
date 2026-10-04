@@ -37,7 +37,7 @@ No caminho de volta, o `MessageReader` lê o fluxo de bytes, junta os pedaços d
 | `host/ScreenShare.Core/Security/PairingUri.cs` | Monta o texto `screenshare://pair?...` que vira o QR. |
 | `host/ScreenShare.Core/Security/DeviceRegistry.cs` | A lista de celulares pareados (arquivo JSON): guarda só o **hash** da chave de cada um. |
 | `host/ScreenShare.DevHost/Program.cs` | O programa de console do host de desenvolvimento: comandos `p`, `l`, `r <id>` e anúncio mDNS. |
-| `host/ScreenShare.DevHost/HostServer.cs` | O servidor TCP: porta 38700 (TLS + pareamento) e porta 38701 (USB, só loopback). |
+| `host/ScreenShare.DevHost/HostServer.cs` | O servidor TCP: porta 38700 (Wi-Fi) e porta 38701 (USB, só loopback), as duas com TLS + pareamento. |
 | `host/ScreenShare.DevHost/LanAddressSelector.cs` | Escolhe quais IPs do PC anunciar e qual vai no QR. |
 | `host/ScreenShare.Tests/ScreenShare.Tests.csproj` | Projeto de testes automáticos (xUnit). Referencia o `Core` e copia os vetores `.hex` para a pasta de saída. |
 | `host/ScreenShare.Tests/Protocol/Vectors.cs` | Lê um arquivo `.hex` de `docs/protocol-vectors` e o transforma em `byte[]`. |
@@ -255,9 +255,9 @@ Declara os vocabulários do protocolo:
 | `TouchMessage` | celular → PC | lista de dedos (`TouchPointer`), cada um com id, ação, posição 0..1 e pressão |
 | `PingMessage` / `PongMessage` | qualquer lado / resposta | um timestamp (para medir latência) |
 | `KeyframeRequestMessage` | celular → PC | nada (só "me mande um quadro completo") |
-| `PairMessage` | celular → PC (Wi-Fi) | o segredo de 32 bytes lido do QR e o nome do celular |
+| `PairMessage` | celular → PC | o segredo de 32 bytes lido do QR e o nome do celular |
 | `PairedMessage` | PC → celular | a chave de acesso de 32 bytes, entregue uma única vez |
-| `AuthMessage` | celular → PC (Wi-Fi) | a chave de acesso, antes do HELLO |
+| `AuthMessage` | celular → PC | a chave de acesso, antes do HELLO |
 | `DeniedMessage` | PC → celular | o motivo da recusa (`DeniedReason`: segredo inválido, aparelho desconhecido, versão incompatível) |
 
 **Keyframe** = quadro de vídeo completo, que pode ser decodificado sozinho. Os outros quadros guardam só as diferenças; se algo se perde, o celular pede um keyframe para "recomeçar".
@@ -387,7 +387,7 @@ No `Reader`, o fluxo acabar antes do primeiro byte de uma mensagem dá `null`; a
 
 ### 5.8 Pareamento e autenticação
 
-Na porta Wi-Fi qualquer aparelho da rede consegue abrir uma conexão, então o PC precisa de duas garantias: o celular fala **com o PC certo** (e não com um impostor) e o PC só atende **celulares que o dono autorizou**. Cada peça de `Security/` cuida de uma parte.
+Na porta Wi-Fi qualquer aparelho da rede consegue abrir uma conexão (e, no USB, qualquer app do celular consegue abrir o `127.0.0.1:38701` que o `adb reverse` cria lá), então o PC precisa de duas garantias: o celular fala **com o PC certo** (e não com um impostor) e o PC só atende **celulares que o dono autorizou**. Cada peça de `Security/` cuida de uma parte.
 
 **A digital do certificado (`HostIdentity`).** Na primeira execução o PC cria um certificado TLS autoassinado e o reaproveita depois. A **digital** (*fingerprint*) é o SHA-256 dos bytes do certificado: um resumo curto, que muda por completo se o certificado mudar. O QR leva essa digital; o celular a guarda e, nas conexões seguintes, **recusa qualquer certificado cuja digital seja diferente**. Assim ninguém consegue se passar pelo PC, mesmo sem uma autoridade certificadora:
 
@@ -433,7 +433,7 @@ var device = new PairedDevice(
 
 Remover um celular (`Remove`, comando `r <id>` do console) apaga a linha dele: a chave dele deixa de funcionar na hora.
 
-**Como as peças se encaixam (`HostServer`).** Na porta Wi-Fi o servidor abre o TLS e olha a primeira mensagem: `PAIR` (primeiro uso) ou `AUTH` (já pareado). Só depois de autenticado é que o fluxo normal, `HELLO` → `CONFIG`, começa:
+**Como as peças se encaixam (`HostServer`).** Nas duas portas (Wi-Fi e USB) o servidor chama o mesmo método, `ServeSecureAsync`: abre o TLS e olha a primeira mensagem: `PAIR` (primeiro uso) ou `AUTH` (já pareado). Só depois de autenticado é que o fluxo normal, `HELLO` → `CONFIG`, começa:
 
 ```csharp
 if (first is PairMessage pair)
@@ -452,7 +452,25 @@ if (first is PairMessage pair)
 
 Qualquer coisa fora do esperado recebe um `DENIED` com o motivo. Prazos evitam que um cliente mudo prenda a porta: 10 s para o TLS e o pareamento, e 10 s sem mensagem alguma depois disso (o app manda `PING` a cada segundo).
 
-**Por que o USB não precisa disso.** A porta 38701 só escuta em `127.0.0.1` (`new TcpListener(IPAddress.Loopback, usbPort)`), ou seja, só aceita conexões vindas do próprio PC. O `adb reverse` faz o cabo USB chegar ali como se fosse local, e o tráfego não passa pela rede: não há quem espionar nem quem se passar por outro. Por isso essa porta vai direto ao `HELLO`, sem TLS e sem pareamento.
+**O USB segue o mesmo caminho.** O `AcceptLoopAsync` recebe o listener e só um rótulo para o log, e as duas portas terminam em `ServeSecureAsync`:
+
+```csharp
+AcceptLoopAsync(_wifi, "Wi-Fi", cancellationToken),
+AcceptLoopAsync(_usb, "USB", cancellationToken));
+...  await ServeSecureAsync(client.GetStream(), cancellationToken);
+```
+
+A porta 38701 continua escutando só em `127.0.0.1` (`new TcpListener(IPAddress.Loopback, usbPort)`), mas isso não basta: o `adb reverse` abre `127.0.0.1:38701` **dentro do celular**, onde qualquer app com internet pode se conectar, e um app também pode ocupar essa porta antes do `adb reverse` para se passar pelo PC. Por isso o USB exige o mesmo TLS (o celular só aceita o certificado de digital fixada) e o mesmo `PAIR`/`AUTH` do Wi-Fi; `HELLO` direto, ou TCP puro, não abre sessão. No app, `Connection.kt` trata o cabo assim:
+
+```kotlin
+is ConnectTarget.Usb -> raw.upgradeToTls(host, port, target.pc.fingerprint)
+...
+is ConnectTarget.Usb -> out.send(AuthMessage(target.pc.token))
+is ConnectTarget.Usb -> LOOPBACK to port
+is ConnectTarget.Pairing -> if (overUsb) LOOPBACK to usbPort else info.host to info.port
+```
+
+Ou seja, o `Usb` conecta em `127.0.0.1`, faz TLS com a digital do PC pareado e manda `AUTH`; e o pareamento também funciona pelo cabo (`overUsb`), com o mesmo QR. Na tela (`HostListScreen.kt`), sem pareamento aparecem **Parear pelo Wi-Fi (QR)** e **Parear pelo cabo USB (QR)**; pareado, **Conectar por cabo USB** e **Parear de novo (QR)**.
 
 **O console (`Program.cs`) e o `LanAddressSelector`.** Digitar `p` chama `pairing.Begin()` para gerar o segredo, monta a URI com `PairingUri.Build` e a desenha como QR no console. O IP que vai no QR vem do `LanAddressSelector.PickForPairing`, que prefere um IP de rede privada (10.x, 172.16-31.x, 192.168.x): o PC pode ter adaptadores de VPN ou de máquina virtual cujos IPs o celular não alcança.
 

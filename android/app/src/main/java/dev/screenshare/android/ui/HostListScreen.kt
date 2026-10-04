@@ -45,6 +45,7 @@ fun HostListScreen(
     pairedPc: PairedPc?,
     message: String?,
     onPair: () -> Unit,
+    onPairUsb: () -> Unit,
     onConnect: (HostAddress) -> Unit,
     onConnectUsb: () -> Unit,
     onForget: () -> Unit,
@@ -66,10 +67,11 @@ fun HostListScreen(
 
             if (pairedPc == null) {
                 Text(
-                    "Para usar pelo Wi-Fi, pareie com o PC: no ScreenShare do PC, peça para parear e escaneie o QR.",
+                    "Pareie com o PC: no ScreenShare do PC, peça para parear e escaneie o QR, pelo Wi-Fi ou pelo cabo USB.",
                     style = MaterialTheme.typography.bodyMedium,
                 )
-                Button(onClick = onPair, enabled = !connecting) { Text("Parear com PC (QR)") }
+                Button(onClick = onPair, enabled = !connecting) { Text("Parear pelo Wi-Fi (QR)") }
+                Button(onClick = onPairUsb, enabled = !connecting) { Text("Parear pelo cabo USB (QR)") }
             } else {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text("PC pareado: ${pairedPc.name}", style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
@@ -99,9 +101,11 @@ fun HostListScreen(
                 ManualAddress(initial = pairedPc.lastHost.orEmpty(), enabled = !connecting, onConnect = onConnect)
             }
 
-            OutlinedButton(onClick = onConnectUsb, enabled = !connecting) { Text("Conectar por cabo USB") }
+            if (pairedPc != null) {
+                OutlinedButton(onClick = onConnectUsb, enabled = !connecting) { Text("Conectar por cabo USB") }
+            }
             Text(
-                "No cabo: ative a depuração USB e rode no PC: adb reverse tcp:$USB_PORT tcp:$USB_PORT",
+                "Pelo cabo: ative a depuração USB e rode no PC: adb reverse tcp:$USB_PORT tcp:$USB_PORT",
                 style = MaterialTheme.typography.bodySmall,
             )
         }
