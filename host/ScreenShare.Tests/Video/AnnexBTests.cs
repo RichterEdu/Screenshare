@@ -100,7 +100,7 @@ public sealed class AnnexBTests
     [Fact]
     public void Frame_vector_data_is_an_h265_keyframe()
     {
-        var data = Vectors.Load("frame.hex")[14..]; // cabeçalho do FRAME (vira MessageCodec.FrameHeaderSize na Task 3)
+        var data = Vectors.Load("frame.hex")[MessageCodec.FrameHeaderSize..];
 
         Assert.True(AnnexB.IsKeyframe(data, VideoCodec.H265));
     }

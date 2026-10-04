@@ -16,6 +16,8 @@ public static class MessageCodec
     public const int SecretLength = 32;
     public const int TokenLength = 32;
     public const int MaxDeviceNameBytes = 64;
+    /// <summary>Cabeçalho completo de um FRAME: 5 do quadro + 8 do timestamp + 1 de flags.</summary>
+    public const int FrameHeaderSize = HeaderSize + 9;
 
     private static readonly UTF8Encoding StrictUtf8 = new(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);
 
@@ -123,6 +125,24 @@ public static class MessageCodec
             default:
                 throw new ArgumentException($"Mensagem não suportada: {message.GetType().Name}.", nameof(message));
         }
+    }
+
+    /// <summary>
+    /// Escreve só o cabeçalho de um FRAME (tipo, tamanho, timestamp e flags), para os dados do vídeo irem direto para
+    /// o stream sem serem copiados para um array novo.
+    /// </summary>
+    public static void WriteFrameHeader(Span<byte> destination, ulong timestampUs, bool isKeyframe, int dataLength)
+    {
+        if (destination.Length < FrameHeaderSize)
+            throw new ArgumentException($"O cabeçalho do FRAME precisa de {FrameHeaderSize} bytes.", nameof(destination));
+        ArgumentOutOfRangeException.ThrowIfNegative(dataLength);
+        var payloadLength = 9L + dataLength;
+        if (payloadLength > MaxPayloadLength)
+            throw new ProtocolException($"Payload de {payloadLength} bytes excede o limite de {MaxPayloadLength}.");
+        destination[0] = (byte)MessageType.Frame;
+        BinaryPrimitives.WriteUInt32LittleEndian(destination[1..], (uint)payloadLength);
+        BinaryPrimitives.WriteUInt64LittleEndian(destination[5..], timestampUs);
+        destination[13] = isKeyframe ? (byte)1 : (byte)0;
     }
 
     public static Message Decode(byte type, ReadOnlySpan<byte> payload)
