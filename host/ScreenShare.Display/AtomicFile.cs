@@ -15,12 +15,29 @@ internal static class AtomicFile
         var temporary = Path.Combine(directory, $".{Path.GetFileName(path)}.{Guid.NewGuid():N}.tmp");
         try
         {
-            File.WriteAllText(temporary, contents, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+            using (var stream = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+            {
+                stream.Write(new UTF8Encoding(encoderShouldEmitUTF8Identifier: false).GetBytes(contents));
+                // Vai para o disco antes da troca: uma queda de energia logo depois não deixa o arquivo vazio.
+                stream.Flush(flushToDisk: true);
+            }
             File.Move(temporary, path, overwrite: true);
         }
         finally
         {
+            TryDelete(temporary);
+        }
+    }
+
+    private static void TryDelete(string temporary)
+    {
+        try
+        {
             if (File.Exists(temporary)) File.Delete(temporary);
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        {
+            // o temporário é só lixo: não pode esconder a falha original da gravação
         }
     }
 }

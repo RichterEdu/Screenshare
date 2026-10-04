@@ -1,3 +1,4 @@
+using System.Text;
 using System.Xml.Linq;
 using ScreenShare.Display;
 
@@ -150,6 +151,59 @@ public sealed class VddSettingsFileTests : IDisposable
 
         VddSettingsFile.EnsureMode(SettingsPath, 2400, 1080);
 
+        Assert.Equal(new[] { "vdd_settings.xml" }, Directory.GetFiles(_dir).Select(f => Path.GetFileName(f)));
+    }
+
+    [Fact]
+    public void Saved_file_is_utf8_without_bom_and_keeps_other_encoding_mentions()
+    {
+        File.WriteAllText(SettingsPath, """
+            <?xml version='1.0' encoding='utf-8'?>
+            <vdd_settings>
+              <!-- exemplo: <?xml version="1.0" encoding="utf-16"?> -->
+              <gpu><friendlyname>Placa de vídeo — ação</friendlyname></gpu>
+              <resolutions>
+                <resolution><width>1920</width><height>1080</height></resolution>
+              </resolutions>
+            </vdd_settings>
+            """);
+
+        VddSettingsFile.EnsureMode(SettingsPath, 2400, 1080);
+
+        var bytes = File.ReadAllBytes(SettingsPath);
+        Assert.Equal("<?xml"u8.ToArray(), bytes[..5]); // sem BOM
+        var text = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true).GetString(bytes);
+        Assert.StartsWith("<?xml version=\"1.0\" encoding=\"utf-8\"?>", text);
+        Assert.Contains("<!-- exemplo: <?xml version=\"1.0\" encoding=\"utf-16\"?> -->", text);
+        Assert.Contains("Placa de vídeo — ação", text);
+    }
+
+    [Fact]
+    public void Added_resolution_goes_on_its_own_line_with_the_file_indentation()
+    {
+        File.WriteAllText(SettingsPath, OfficialSample);
+
+        VddSettingsFile.EnsureMode(SettingsPath, 2400, 1080);
+
+        var text = File.ReadAllText(SettingsPath).Replace("\r\n", "\n");
+        Assert.Contains(
+            "</resolution>\n        <resolution><width>2400</width><height>1080</height><refresh_rate>60</refresh_rate></resolution>\n    </resolutions>",
+            text);
+    }
+
+    [Fact]
+    public void Failed_write_keeps_the_original_file_and_leaves_no_temporary()
+    {
+        File.WriteAllText(SettingsPath, OfficialSample);
+
+        // Outro programa com o arquivo aberto sem permitir apagar: dá para ler, mas não para trocar.
+        using (new FileStream(SettingsPath, FileMode.Open, FileAccess.Read, FileShare.Read))
+        {
+            var error = Record.Exception(() => VddSettingsFile.EnsureMode(SettingsPath, 2400, 1080));
+            Assert.True(error is IOException or UnauthorizedAccessException, $"erro inesperado: {error}");
+        }
+
+        Assert.Equal(OfficialSample, File.ReadAllText(SettingsPath));
         Assert.Equal(new[] { "vdd_settings.xml" }, Directory.GetFiles(_dir).Select(f => Path.GetFileName(f)));
     }
 }

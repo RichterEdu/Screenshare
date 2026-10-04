@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Text;
 using System.Xml;
 using System.Xml.Linq;
 
@@ -38,9 +39,9 @@ public static class VddSettingsFile
         if (resolutions is null)
         {
             resolutions = new XElement("resolutions");
-            root.Add(resolutions);
+            AppendKeepingIndentation(root, resolutions);
         }
-        resolutions.Add(Resolution(width, height));
+        AppendKeepingIndentation(resolutions, Resolution(width, height));
         Save(doc, path);
         return true;
     }
@@ -94,13 +95,37 @@ public static class VddSettingsFile
         return doc;
     }
 
+    /// <summary>
+    /// Acrescenta <paramref name="child"/> numa linha própria, com o mesmo recuo do último irmão. O arquivo é lido
+    /// com os espaços originais, e o XmlWriter não recua sozinho conteúdo que já tem espaços (conteúdo misto).
+    /// </summary>
+    private static void AppendKeepingIndentation(XElement parent, XElement child)
+    {
+        var beforeClosingTag = parent.LastNode as XText;
+        var beforeLastSibling = parent.Elements().LastOrDefault()?.PreviousNode as XText;
+        if (beforeClosingTag is not null && string.IsNullOrWhiteSpace(beforeClosingTag.Value) &&
+            beforeLastSibling is not null && string.IsNullOrWhiteSpace(beforeLastSibling.Value))
+        {
+            beforeClosingTag.AddBeforeSelf(new XText(beforeLastSibling.Value), child);
+        }
+        else
+        {
+            parent.Add(child);
+        }
+    }
+
     private static void Save(XDocument doc, string path)
     {
-        using var buffer = new StringWriter(CultureInfo.InvariantCulture);
-        using (var writer = XmlWriter.Create(buffer, new XmlWriterSettings { Indent = true, OmitXmlDeclaration = false }))
+        // O XmlWriter declara a codificação dele mesmo: UTF-8 sem BOM, que é como o driver lê o arquivo.
+        using var buffer = new MemoryStream();
+        using (var writer = XmlWriter.Create(buffer, new XmlWriterSettings
+               {
+                   Indent = true,
+                   Encoding = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false),
+               }))
+        {
             doc.Save(writer);
-        // StringWriter declara utf-16; o arquivo é gravado em UTF-8, então a declaração tem de dizer utf-8.
-        var text = buffer.ToString().Replace("encoding=\"utf-16\"", "encoding=\"utf-8\"", StringComparison.Ordinal);
-        AtomicFile.WriteAllText(path, text);
+        }
+        AtomicFile.WriteAllText(path, Encoding.UTF8.GetString(buffer.ToArray()));
     }
 }
