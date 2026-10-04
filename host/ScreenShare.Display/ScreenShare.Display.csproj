@@ -10,4 +10,8 @@
     <PackageReference Include="System.Security.Cryptography.Pkcs" Version="10.0.0" />
   </ItemGroup>
 
+  <ItemGroup>
+    <InternalsVisibleTo Include="ScreenShare.Tests" />
+  </ItemGroup>
+
 </Project>
