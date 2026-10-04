@@ -111,16 +111,16 @@ Projeto novo: **`host/ScreenShare.Display`** (`net10.0-windows`). O `ScreenShare
 
 ## Instalação (`install-driver`, como administrador)
 
-1. Se já existe um dispositivo `Root\MttVDD` **com driver**, só prepara o XML e as permissões (passo 6) e sai com 0. Um dispositivo que ficou sem driver (instalação interrompida) não conta.
+1. Se já existe um dispositivo `Root\MttVDD` **com driver**, só prepara o XML e as permissões (passo 5) e sai com 0. Um dispositivo que ficou sem driver (instalação interrompida) não conta.
 2. Baixa o zip por HTTPS e confere o SHA-256 fixado. Se não bater, aborta sem instalar nada (código 2).
 3. Extrai numa pasta temporária.
 4. Lê os certificados do `mttvdd.cat` (antes de instalar: se o catálogo não abrir, nada foi instalado) e anota as impressões dos certificados em `TrustedPublisher` (máquina).
-5. **Instala o driver:**
+5. Cria `C:\VirtualDisplayDriver\vdd_settings.xml` se faltar (count 1, 1920×1080@60). Dá permissão de modificação na pasta ao usuário (SID recebido do processo pai) e a `LOCAL SERVICE`. Isso vem **antes** do driver, porque ele lê o XML assim que é instalado (no teste manual da Task 3, com a ordem invertida, o driver subiu com a lista padrão dele). Se a instalação for recusada ou falhar, a pasta fica; `uninstall-driver` a apaga.
+6. **Instala o driver:**
    - remove dispositivos `Root\MttVDD` que tenham ficado sem driver (senão o driver seria ligado aos dois e haveria dois adaptadores);
    - cria o dispositivo `Root\MttVDD` (SetupAPI: `SetupDiCreateDeviceInfoList`, `SetupDiCreateDeviceInfoW` com `DICD_GENERATE_ID`, `SetupDiSetDeviceRegistryPropertyW(SPDRP_HARDWAREID)` e `SetupDiCallClassInstaller(DIF_REGISTERDEVICE)`);
    - instala com `UpdateDriverForPlugAndPlayDevicesW`. O Windows mostra uma vez a confirmação "Deseja instalar este software de dispositivo?".
    - Se a instalação falhar, o dispositivo recém-criado é removido.
-6. Cria `C:\VirtualDisplayDriver\vdd_settings.xml` se faltar (count 1, 1920×1080@60). Dá permissão de modificação na pasta ao usuário (SID recebido do processo pai) e a `LOCAL SERVICE`.
 7. **Remove de `TrustedPublisher`** os certificados que não estavam lá antes e que vêm do `mttvdd.cat`. A caixa "Sempre confiar" da confirmação do Windows vem marcada; o driver já instalado não precisa dela.
 8. Apaga a pasta temporária e sai com 0.
 
