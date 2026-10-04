@@ -53,18 +53,24 @@ sealed interface ConnectionState {
 
 /** Para onde e como conectar. */
 sealed interface ConnectTarget {
-    /** Cabo USB: 127.0.0.1 depois do `adb reverse tcp:38701 tcp:38701`, sem TLS nem pareamento. */
-    data class Usb(val port: Int = USB_PORT) : ConnectTarget
+    /** Cabo USB com o PC já pareado: 127.0.0.1 depois do `adb reverse`, e então o mesmo fluxo do Wi-Fi (TLS com a digital fixa, AUTH). */
+    data class Usb(val pc: PairedPc, val port: Int = USB_PORT) : ConnectTarget
 
     /** Wi-Fi com o PC já pareado: TLS com a digital fixa, depois AUTH. */
     data class Wifi(val address: HostAddress, val pc: PairedPc) : ConnectTarget
 
     /** Primeiro contato vindo do QR: TLS com a digital do QR, PAIR → PAIRED, depois AUTH. */
-    data class Pairing(val info: PairingInfo, val deviceName: String) : ConnectTarget
+    data class Pairing(
+        val info: PairingInfo,
+        val deviceName: String,
+        /** Pareia pelo cabo: conecta em 127.0.0.1:[usbPort] em vez do IP do QR (o IP continua sendo o `lastHost` salvo). */
+        val overUsb: Boolean = false,
+        val usbPort: Int = USB_PORT,
+    ) : ConnectTarget
 }
 
 /**
- * Conexão com o host: (TLS + PAIR/AUTH no Wi-Fi) → HELLO → CONFIG, depois PING periódico para medir a latência.
+ * Conexão com o host: (TLS + PAIR/AUTH, no Wi-Fi e no USB) → HELLO → CONFIG, depois PING periódico para medir a latência.
  * Uma conexão por vez; chamar [connect] de novo encerra a anterior.
  * [onPaired] é chamado (na thread de IO) quando um pareamento termina, com os dados a salvar.
  */
@@ -102,7 +108,7 @@ class Connection(
             raw.tcpNoDelay = true
             raw.connect(InetSocketAddress(host, port), handshakeTimeoutMs)
             val s = when (target) {
-                is ConnectTarget.Usb -> raw
+                is ConnectTarget.Usb -> raw.upgradeToTls(host, port, target.pc.fingerprint)
                 is ConnectTarget.Wifi -> raw.upgradeToTls(host, port, target.pc.fingerprint)
                 is ConnectTarget.Pairing -> raw.upgradeToTls(host, port, target.info.fingerprint)
             }
@@ -111,7 +117,7 @@ class Connection(
             val reader = MessageReader(s.getInputStream())
 
             when (target) {
-                is ConnectTarget.Usb -> Unit
+                is ConnectTarget.Usb -> out.send(AuthMessage(target.pc.token))
                 is ConnectTarget.Wifi -> out.send(AuthMessage(target.pc.token))
                 is ConnectTarget.Pairing -> {
                     out.send(PairMessage(target.info.secret, target.deviceName))
@@ -120,7 +126,7 @@ class Connection(
                         is DeniedMessage -> return denied(reply.reason)
                         else -> return fail("Resposta inesperada do PC durante o pareamento")
                     }
-                    onPaired(PairedPc(target.info.pcName, target.info.fingerprint, token, host))
+                    onPaired(PairedPc(target.info.pcName, target.info.fingerprint, token, target.info.host))
                     out.send(AuthMessage(token))
                 }
             }
@@ -167,9 +173,9 @@ class Connection(
     }
 
     private fun ConnectTarget.endpoint(): kotlin.Pair<String, Int> = when (this) {
-        is ConnectTarget.Usb -> "127.0.0.1" to port
+        is ConnectTarget.Usb -> LOOPBACK to port
         is ConnectTarget.Wifi -> address.host to address.port
-        is ConnectTarget.Pairing -> info.host to info.port
+        is ConnectTarget.Pairing -> if (overUsb) LOOPBACK to usbPort else info.host to info.port
     }
 
     /** TLS por cima do socket já conectado, aceitando só o certificado com a digital esperada. */
@@ -202,6 +208,10 @@ class Connection(
             "Este não é o PC pareado (certificado diferente). Pareie de novo."
         this is SSLException -> "Falha na conexão segura: ${message ?: "erro de TLS"}"
         else -> message?.takeIf { it.isNotBlank() } ?: "Erro de rede"
+    }
+
+    private companion object {
+        const val LOOPBACK = "127.0.0.1"
     }
 
     private fun Throwable.causes() = generateSequence(this) { it.cause }

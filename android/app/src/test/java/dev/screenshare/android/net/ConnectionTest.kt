@@ -16,8 +16,6 @@ import dev.screenshare.android.protocol.PongMessage
 import dev.screenshare.android.protocol.VideoCodec
 import dev.screenshare.android.security.PairedPc
 import dev.screenshare.android.security.TestTls
-import java.net.InetAddress
-import java.net.ServerSocket
 import java.net.Socket
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -34,10 +32,9 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
-/** Testa a Connection contra servidores reais em loopback: TCP puro (USB) e TLS com certificado de teste (Wi-Fi). */
+/** Testa a Connection contra servidores TLS reais em loopback, com certificado de teste (Wi-Fi e USB usam o mesmo fluxo). */
 class ConnectionTest {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private val server = ServerSocket(0, 1, InetAddress.getLoopbackAddress())
     private val tlsServer = TestTls.serverSocket("host")
     private val screen = ScreenInfo(width = 2400, height = 1080, densityDpi = 420)
     private val config = ConfigMessage(2400, 1080, VideoCodec.H264, 8000, ByteArray(0))
@@ -47,7 +44,6 @@ class ConnectionTest {
     @After
     fun tearDown() {
         scope.cancel()
-        server.close()
         tlsServer.close()
     }
 
@@ -56,7 +52,7 @@ class ConnectionTest {
         onPaired = { synchronized(paired) { paired.add(it) } },
     )
 
-    private fun usb() = ConnectTarget.Usb(port = server.localPort)
+    private fun usb() = ConnectTarget.Usb(PairedPc("PC de teste", hostFingerprint, TOKEN, null), port = tlsServer.localPort)
 
     private fun wifi(fingerprint: String = hostFingerprint) = ConnectTarget.Wifi(
         HostAddress("127.0.0.1", tlsServer.localPort), PairedPc("PC de teste", fingerprint, TOKEN, null),
@@ -71,12 +67,7 @@ class ConnectionTest {
     private suspend fun Connection.await(predicate: (ConnectionState) -> Boolean): ConnectionState =
         withTimeout(5_000) { state.first(predicate) }
 
-    /** Lado PC no USB (TCP puro). */
-    private fun serving(block: (Socket, MessageReader) -> Unit) = scope.async {
-        server.accept().use { socket -> block(socket, MessageReader(socket.getInputStream())) }
-    }
-
-    /** Lado PC no Wi-Fi (TLS com o certificado "host"). */
+    /** Lado PC (Wi-Fi e USB): TLS com o certificado "host". */
     private fun servingTls(block: (Socket, MessageReader) -> Unit) = scope.async {
         tlsServer.accept().use { socket -> block(socket, MessageReader(socket.getInputStream())) }
     }
@@ -86,7 +77,8 @@ class ConnectionTest {
     @Test
     fun usbHandshakeSendsHelloWithScreenInfoAndEndsConnected() = runBlocking {
         var received: Message? = null
-        val serverSide = serving { socket, reader ->
+        val serverSide = servingTls { socket, reader ->
+            assertEquals(AuthMessage(TOKEN), reader.read())
             received = reader.read()
             socket.send(config)
             reader.read() // mantém a conexão aberta até o cliente pingar
@@ -104,7 +96,8 @@ class ConnectionTest {
 
     @Test
     fun pongsProduceARoundTripTime() = runBlocking {
-        val serverSide = serving { socket, reader ->
+        val serverSide = servingTls { socket, reader ->
+            reader.read() // AUTH
             reader.read() // HELLO
             socket.send(config)
             while (true) {
@@ -126,7 +119,7 @@ class ConnectionTest {
 
     @Test
     fun serverClosingBeforeConfigFails() = runBlocking {
-        val serverSide = serving { _, reader -> reader.read() } // lê o HELLO e fecha
+        val serverSide = servingTls { _, reader -> reader.read(); reader.read() } // lê AUTH e HELLO e fecha
         val connection = newConnection()
 
         connection.connect(usb())
@@ -138,8 +131,9 @@ class ConnectionTest {
 
     @Test
     fun serverDroppingAfterConnectedFails() = runBlocking {
-        val serverSide = serving { socket, reader ->
-            reader.read()
+        val serverSide = servingTls { socket, reader ->
+            reader.read() // AUTH
+            reader.read() // HELLO
             socket.send(config)
         } // sai do bloco e fecha o socket
         val connection = newConnection()
@@ -154,8 +148,9 @@ class ConnectionTest {
     @Test
     fun disconnectEndsInDisconnectedAndServerSeesTheClose() = runBlocking {
         var serverSawClose = false
-        val serverSide = serving { socket, reader ->
-            reader.read()
+        val serverSide = servingTls { socket, reader ->
+            reader.read() // AUTH
+            reader.read() // HELLO
             socket.send(config)
             while (reader.read() != null) { /* ignora PINGs até o cliente fechar */ }
             serverSawClose = true
@@ -173,11 +168,11 @@ class ConnectionTest {
 
     @Test
     fun connectionRefusedFails() = runBlocking {
-        val port = server.localPort
-        server.close() // nada escutando nessa porta
+        val port = tlsServer.localPort
+        tlsServer.close() // nada escutando nessa porta
         val connection = newConnection()
 
-        connection.connect(ConnectTarget.Usb(port))
+        connection.connect(ConnectTarget.Usb(PairedPc("PC de teste", hostFingerprint, TOKEN, null), port))
         val state = connection.await { it is ConnectionState.Failed }
 
         assertTrue((state as ConnectionState.Failed).reason.isNotBlank())
@@ -255,7 +250,8 @@ class ConnectionTest {
 
     @Test
     fun usbDeniedForIncompatibleVersionIsReported() = runBlocking {
-        val serverSide = serving { socket, reader ->
+        val serverSide = servingTls { socket, reader ->
+            reader.read() // AUTH
             reader.read() // HELLO
             socket.send(DeniedMessage(DeniedReason.INCOMPATIBLE_VERSION))
         }
@@ -285,7 +281,7 @@ class ConnectionTest {
 
     @Test
     fun serverThatNeverAnswersHelloFailsWithATimeoutMessageInPortuguese() = runBlocking {
-        val serverSide = serving { _, _ -> Thread.sleep(3_000) } // aceita e nunca responde (> handshakeTimeoutMs)
+        val serverSide = servingTls { _, _ -> Thread.sleep(3_000) } // aceita e nunca responde (> handshakeTimeoutMs)
         val connection = newConnection()
 
         connection.connect(usb())
@@ -295,6 +291,71 @@ class ConnectionTest {
             "O PC não respondeu a tempo. Se a conexão anterior caiu agora, espere uns 10 segundos e tente de novo.",
             state.reason,
         )
+        serverSide.await()
+    }
+
+    @Test
+    fun usbSendsAuthOverTlsThenHello() = runBlocking {
+        val received = mutableListOf<Message?>()
+        val serverSide = servingTls { socket, reader ->
+            received += reader.read()
+            received += reader.read()
+            socket.send(config)
+            reader.read()
+        }
+        val connection = newConnection()
+
+        connection.connect(usb())
+        connection.await { it is ConnectionState.Connected }
+
+        assertEquals(listOf(AuthMessage(TOKEN), hello()), received)
+        connection.disconnect()
+        serverSide.await()
+    }
+
+    @Test
+    fun usbWithDifferentCertificateFailsWithoutSendingTheToken() = runBlocking {
+        val otherServer = TestTls.serverSocket("other")
+        try {
+            var received: Result<Message?>? = null
+            val serverSide = scope.async {
+                otherServer.accept().use { socket -> received = runCatching { MessageReader(socket.getInputStream()).read() } }
+            }
+            val connection = newConnection()
+
+            connection.connect(ConnectTarget.Usb(PairedPc("PC de teste", hostFingerprint, TOKEN, null), port = otherServer.localPort))
+            val state = connection.await { it is ConnectionState.Failed } as ConnectionState.Failed
+
+            assertTrue(state.reason, state.reason.contains("não é o PC pareado"))
+            assertNull(state.denied)
+            serverSide.await()
+            assertTrue("o PC recebeu dados: $received", received!!.isFailure || received!!.getOrNull() == null)
+        } finally {
+            otherServer.close()
+        }
+    }
+
+    @Test
+    fun pairingOverUsbConnectsToLoopbackUsbPort() = runBlocking {
+        val serverSide = servingTls { socket, reader ->
+            assertEquals(PairMessage(SECRET, "Pixel 8"), reader.read())
+            socket.send(PairedMessage(TOKEN))
+            assertEquals(AuthMessage(TOKEN), reader.read())
+            assertEquals(hello(), reader.read())
+            socket.send(config)
+            reader.read()
+        }
+        val connection = newConnection()
+        val target = ConnectTarget.Pairing(
+            PairingInfo("192.168.0.10", DEFAULT_PORT, hostFingerprint, SECRET, "PC de teste"), "Pixel 8",
+            overUsb = true, usbPort = tlsServer.localPort,
+        )
+
+        connection.connect(target)
+        connection.await { it is ConnectionState.Connected }
+
+        assertEquals(listOf(PairedPc("PC de teste", hostFingerprint, TOKEN, "192.168.0.10")), synchronized(paired) { paired.toList() })
+        connection.disconnect()
         serverSide.await()
     }
 

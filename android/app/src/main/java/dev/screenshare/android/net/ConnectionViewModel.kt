@@ -60,15 +60,15 @@ class ConnectionViewModel(application: Application) : AndroidViewModel(applicati
         }
     }
 
-    /** Texto lido do QR. */
-    fun pair(qrText: String) {
+    /** Texto lido do QR; [overUsb] pareia pelo cabo (127.0.0.1, depois do `adb reverse`) em vez de pelo IP do QR. */
+    fun pair(qrText: String, overUsb: Boolean = false) {
         val info = PairingUri.parse(qrText)
         if (info == null) {
             _message.value = "Este QR não é de pareamento do ScreenShare."
             return
         }
         _message.value = null
-        connection.connect(ConnectTarget.Pairing(info, deviceNameOf(Build.MODEL)))
+        connection.connect(ConnectTarget.Pairing(info, deviceNameOf(Build.MODEL), overUsb))
     }
 
     fun showMessage(text: String) {
@@ -87,8 +87,13 @@ class ConnectionViewModel(application: Application) : AndroidViewModel(applicati
     }
 
     fun connectUsb() {
+        val pc = _pairedPc.value
+        if (pc == null) {
+            _message.value = "Pareie com o PC primeiro (pelo Wi-Fi ou pelo cabo)."
+            return
+        }
         _message.value = null
-        connection.connect(ConnectTarget.Usb())
+        connection.connect(ConnectTarget.Usb(pc))
     }
 
     fun forgetPc() {
