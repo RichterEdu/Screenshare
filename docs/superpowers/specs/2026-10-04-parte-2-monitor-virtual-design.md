@@ -204,6 +204,8 @@ Manuais, no PC do usuário, ao fim do plano:
 | E6 | `ChangeDisplaySettingsEx` com 0×0 (`detach`) e com posição e tamanho (`attach`), sem admin | ✅ Cada operação leva ~130 ms. **10 ciclos sem falha**, mesmo processo do driver, dispositivo OK. |
 | E7 | Aplicar 2400×1080 com `ChangeDisplaySettingsEx`, sem admin | ✅ |
 | E8 | Escala via `DisplayConfigGetDeviceInfo(-3)` / `DisplayConfigSetDeviceInfo(-4)`, sem admin | ✅ Recomendada 100% (`min 0`), máximo informado 175% (`max 3`); pedir 200% (rel 4) foi aceito. Depois de o usuário escolher 150% em Configurações › Tela, a leitura deu 150%. |
+| E6b | Monitor desanexado e PC reiniciado com o host fechado | ✅ Continua desanexado depois do login: o mouse não passa para ele e só há uma tela ativa. Ele **continua listado em Configurações › Tela** (conectado, fora da área de trabalho) enquanto o driver estiver instalado. |
+| E9 | Desinstalar (`DIF_REMOVE` + `SetupUninstallOEMInfW(SUOI_FORCEDELETE)`), admin | ✅ Dispositivo e pacote `oem288.inf` removidos sem reiniciar; nenhum `mttvdd` sobra em `pnputil /enum-drivers`. A pasta `C:\VirtualDisplayDriver` não é apagada pela desinstalação do driver (o instalador do ScreenShare apaga). |
 
 ### Decisões tomadas a partir do spike
 
