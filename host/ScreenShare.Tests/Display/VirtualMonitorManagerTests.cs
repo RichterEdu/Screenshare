@@ -28,6 +28,18 @@ public sealed class VirtualMonitorManagerTests : IDisposable
         lock (_log) _log.Add(message);
     });
 
+    /// <summary>Avança o relógio falso em passos de 250 ms até o reinício em segundo plano terminar (ele espera até 5 s).</summary>
+    private async Task AdvanceUntilRestartFinishesAsync(VirtualMonitorManager manager)
+    {
+        for (var step = 0; !manager.PendingRestart.IsCompleted; step++)
+        {
+            Assert.True(step < 400, "o reinício em segundo plano não terminou");
+            _time.Advance(TimeSpan.FromMilliseconds(250));
+            await Task.Delay(5);
+        }
+        await manager.PendingRestart;
+    }
+
     [Fact]
     public void Startup_turns_off_a_monitor_left_attached_and_remembers_where_it_was()
     {
@@ -211,6 +223,41 @@ public sealed class VirtualMonitorManagerTests : IDisposable
     }
 
     [Fact]
+    public async Task Restart_without_the_new_mode_leaves_the_monitor_off_when_nobody_is_connected()
+    {
+        var restart = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        _restarter = new FakeRestarter(() => restart.Task);
+        using var manager = Create();
+        manager.Acquire(2400, 1080, 420).Dispose();
+        _time.Advance(TimeSpan.FromSeconds(11));
+        Assert.False(_topology.Attached);
+
+        _topology.Attached = true; // o Windows religou a saída, mas o driver voltou sem 2400×1080
+        restart.SetResult(true);
+        await AdvanceUntilRestartFinishesAsync(manager);
+
+        Assert.False(_topology.Attached);
+        Assert.Contains(_log, line => line.Contains("não apareceu"));
+    }
+
+    [Fact]
+    public async Task Restart_without_the_new_mode_puts_the_monitor_back_for_a_connected_phone()
+    {
+        var restart = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        _restarter = new FakeRestarter(() => restart.Task);
+        using var manager = Create();
+        using var lease = manager.Acquire(2400, 1080, 420);
+        Assert.True(_topology.Attached); // na mais próxima (1920×1080) enquanto o UAC espera
+
+        _topology.Attached = false; // o driver voltou com a saída fora da área de trabalho e sem 2400×1080
+        restart.SetResult(true);
+        await AdvanceUntilRestartFinishesAsync(manager);
+
+        Assert.True(_topology.Attached);
+        Assert.Equal((1920, 1080), _topology.Size);
+    }
+
+    [Fact]
     public void Corrupted_settings_file_uses_nearest_mode_without_restart()
     {
         File.WriteAllText(SettingsPath, "<vdd_settings><resolutions>");
@@ -248,7 +295,7 @@ public sealed class VirtualMonitorManagerTests : IDisposable
         using var lease = manager.Acquire(1920, 1080, 160);
 
         Assert.Null(lease.Monitor);
-        Assert.NotEmpty(_log);
+        Assert.Contains(_log, line => line.Contains("Monitor virtual indisponível"));
     }
 
     [Fact]
@@ -311,6 +358,19 @@ public sealed class VirtualMonitorManagerTests : IDisposable
 
         Assert.Null(lease.Monitor);
         Assert.False(_topology.Attached);
+    }
+
+    [Fact]
+    public void Error_while_another_phone_uses_the_monitor_keeps_it_on()
+    {
+        using var manager = Create();
+        using var first = manager.Acquire(1920, 1080, 160);
+        _topology.ThrowOnGetScale = new Win32Exception(5);
+
+        using var second = manager.Acquire(1920, 1080, 160);
+
+        Assert.Null(second.Monitor);
+        Assert.True(_topology.Attached);
     }
 
     [Fact]

@@ -223,15 +223,38 @@ public sealed class VirtualMonitorManager : IVirtualMonitorManager, IDisposable
                 catch (Exception e)
                 {
                     _log($"Falha ao aplicar a resolução nova: {e.Message}");
+                    SettleAfterRestart(request);
                     return;
                 }
             }
             if (_time.GetUtcNow() >= deadline)
             {
                 _log($"O driver reiniciou, mas {request.Width}×{request.Height} não apareceu.");
+                lock (_gate)
+                {
+                    if (!_disposed) SettleAfterRestart(request);
+                }
                 return;
             }
             await Task.Delay(PollInterval, _time);
+        }
+    }
+
+    /// <summary>
+    /// Depois de um reinício que não trouxe a resolução nova (ou que falhou no meio): deixa o monitor coerente com
+    /// quem está conectado — ligado, na resolução mais próxima, se há sessão; desligado se não há e nada está agendado.
+    /// O driver reiniciado pode voltar com a saída ligada ou desligada. Chamado com a trava; nunca lança.
+    /// </summary>
+    private void SettleAfterRestart(MonitorRequest request)
+    {
+        try
+        {
+            if (_leases > 0) Apply(request, shareIfInUse: true);
+            else if (_turnOff is null) TurnOff("depois de reiniciar o driver");
+        }
+        catch (Exception e)
+        {
+            _log($"Falha ao acertar o monitor virtual depois do reinício: {e.Message}");
         }
     }
 
