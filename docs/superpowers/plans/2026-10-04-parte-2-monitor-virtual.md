@@ -2190,6 +2190,7 @@ internal sealed class FakeDisplayTopology : IDisplayTopology
     public Func<DisplayPosition, bool> AcceptPosition { get; set; } = _ => true;
     public bool FailScale { get; set; }
     public Exception? ThrowOnFind { get; set; }
+    public Exception? ThrowOnGetScale { get; set; }
     public int AttachCalls { get; private set; }
     public int DetachCalls { get; private set; }
     public int SetModeCalls { get; private set; }
@@ -2232,7 +2233,11 @@ internal sealed class FakeDisplayTopology : IDisplayTopology
         return true;
     }
 
-    public int? GetScale(string deviceName) => Attached ? Scale : null;
+    public int? GetScale(string deviceName)
+    {
+        if (ThrowOnGetScale is { } error) throw error;
+        return Attached ? Scale : null;
+    }
 
     public bool SetScale(string deviceName, int percent)
     {
@@ -2531,6 +2536,40 @@ public sealed class VirtualMonitorManagerTests : IDisposable
     }
 
     [Fact]
+    public void Failing_to_save_state_never_keeps_the_monitor_on()
+    {
+        File.WriteAllText(Path.Combine(_dir, "arquivo"), "");
+        // A "pasta" do display.json é um arquivo: toda gravação do estado falha.
+        var brokenState = new DisplayStateStore(Path.Combine(_dir, "arquivo", "display.json"));
+        using var manager = new VirtualMonitorManager(_topology, _restarter, brokenState, SettingsPath, _time, message =>
+        {
+            lock (_log) _log.Add(message);
+        });
+
+        var lease = manager.Acquire(1920, 1080, 320);
+        Assert.NotNull(lease.Monitor);
+        Assert.Equal(175, _topology.Scale); // a escala foi aplicada mesmo sem poder ser lembrada
+
+        lease.Dispose();
+        _time.Advance(TimeSpan.FromSeconds(11));
+
+        Assert.False(_topology.Attached);
+        Assert.Contains(_log, line => line.Contains("Não foi possível gravar"));
+    }
+
+    [Fact]
+    public void Error_after_attaching_turns_the_monitor_back_off()
+    {
+        _topology.ThrowOnGetScale = new Win32Exception(5);
+        using var manager = Create();
+
+        using var lease = manager.Acquire(1920, 1080, 160);
+
+        Assert.Null(lease.Monitor);
+        Assert.False(_topology.Attached);
+    }
+
+    [Fact]
     public void Dispose_turns_off_at_once_and_later_acquires_have_no_monitor()
     {
         var manager = Create();
@@ -2715,6 +2754,8 @@ public sealed class VirtualMonitorManager : IVirtualMonitorManager, IDisposable
             catch (Exception e)
             {
                 _log($"Monitor virtual indisponível nesta conexão: {e.Message}");
+                // Se chegou a ligar antes de falhar, não fica ligado sem ninguém usando.
+                if (_leases == 0 && _turnOff is null) TurnOff("falha ao ligar");
                 monitor = null;
             }
             if (monitor is null) return VirtualMonitorLease.Without(request);
@@ -2788,8 +2829,25 @@ public sealed class VirtualMonitorManager : IVirtualMonitorManager, IDisposable
     {
         if (_state.IsScaled(request.Width, request.Height)) return;
         var percent = ScaleCalculator.FromDpi(request.DensityDpi);
-        if (_topology.SetScale(deviceName, percent)) _state.MarkScaled(request.Width, request.Height);
-        else _log($"Não foi possível ajustar a escala do monitor virtual para {percent}%.");
+        if (!_topology.SetScale(deviceName, percent))
+        {
+            _log($"Não foi possível ajustar a escala do monitor virtual para {percent}%.");
+            return;
+        }
+        TrySave(() => _state.MarkScaled(request.Width, request.Height));
+    }
+
+    /// <summary>Gravar o display.json é conveniência: se falhar, registra e segue (nunca impede ligar ou desligar).</summary>
+    private void TrySave(Action save)
+    {
+        try
+        {
+            save();
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        {
+            _log($"Não foi possível gravar o estado do monitor virtual: {e.Message}");
+        }
     }
 
     private VirtualMonitor Describe(VddOutput output) => new(output.DeviceName, output.X, output.Y, output.Width, output.Height,
@@ -2909,7 +2967,7 @@ public sealed class VirtualMonitorManager : IVirtualMonitorManager, IDisposable
         try
         {
             if (_topology.FindVddOutput() is not { Attached: true } output) return;
-            _state.SaveLastPosition(new DisplayPosition(output.X, output.Y));
+            TrySave(() => _state.SaveLastPosition(new DisplayPosition(output.X, output.Y)));
             _log(_topology.Detach(output.DeviceName)
                 ? $"Monitor virtual desligado ({reason})."
                 : "O Windows não aceitou desligar o monitor virtual.");
@@ -2923,7 +2981,7 @@ public sealed class VirtualMonitorManager : IVirtualMonitorManager, IDisposable
 ```
 
 Run: `dotnet test host/ScreenShare.slnx --filter FullyQualifiedName~VirtualMonitorManagerTests`
-Expected: PASS (24 casos).
+Expected: PASS (26 casos).
 
 - [ ] **Step 5: Rodar tudo, commit e push**
 

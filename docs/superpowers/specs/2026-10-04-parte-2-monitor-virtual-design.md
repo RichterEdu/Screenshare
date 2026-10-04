@@ -151,6 +151,8 @@ Sem driver instalado, sai com 0.
 | O Windows recusa a resolução | Mantém a que está e a informa no `CONFIG` |
 | A escala falha | Deixa como está, registra o erro e não grava no `display.json` (tenta de novo na próxima vez) |
 | XML corrompido | Registra o erro; não pede reinício; usa a resolução disponível mais próxima; o arquivo não é sobrescrito |
+| Falha ao gravar o `display.json` | Registra e segue: a escala e a posição só não ficam lembradas; ligar e desligar nunca dependem disso |
+| Erro depois de o monitor já ter sido ligado | O monitor é desligado de novo (ninguém ficou com ele) e a sessão segue sem monitor |
 | UAC do reinício recusado | Registra o erro; não pergunta de novo até o host reiniciar; a conexão segue com a resolução mais próxima |
 
 ## Segurança
