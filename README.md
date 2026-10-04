@@ -28,7 +28,7 @@ Os apps de "segunda tela" existentes pedem configuração chata ou não aceitam 
 
 ```
  PC (host, C#)                                   Celular (Android, Kotlin)
-┌───────────────────────────┐   TCP único        ┌──────────────────────────┐
+┌───────────────────────────┐   TCP + TLS        ┌──────────────────────────┐
 │ Monitor virtual (VDD)     │  (Wi-Fi ou USB)    │ Decodifica H.265/H.264   │
 │ Captura DXGI              │ ─── vídeo ───────▶ │ (MediaCodec → Surface)   │
 │ Encode por hardware       │                    │                          │
@@ -41,19 +41,20 @@ Os apps de "segunda tela" existentes pedem configuração chata ou não aceitam 
 | Monitor virtual | [Virtual Display Driver](https://github.com/VirtualDrivers/Virtual-Display-Driver) (open source, já assinado), instalado pelo DevHost; liga e desliga pelo próprio Windows, sem administrador |
 | Captura | DXGI Desktop Duplication (`Vortice.Windows`) |
 | Encode | H.265 (fallback H.264) em hardware via Media Foundation |
-| Transporte | TCP com `TCP_NODELAY`; mDNS no Wi-Fi, `adb reverse` no USB |
+| Transporte | TCP com `TCP_NODELAY` e TLS 1.2+ (certificado do PC fixado no pareamento); mDNS no Wi-Fi, `adb reverse` no USB |
+| Pareamento | QR com endereço, digital do certificado e segredo de uso único; chave de acesso guardada no Android Keystore |
 | Toque | `MotionEvent` → pacote `TOUCH` → `InjectSyntheticPointerInput` |
 
 O formato dos bytes trocados entre os dois lados está em [`docs/protocol.md`](docs/protocol.md).
 
 ## 🗺️ Roadmap
 
-- [x] **Parte 1 — Fundação**: protocolo v1 completo — as 7 mensagens (`HELLO`, `CONFIG`, `FRAME`, `TOUCH`, `PING`, `PONG`, `KEYFRAME_REQ`) e o `MessageReader` — em C# e em Kotlin (`android/`), testados contra os mesmos vetores
+- [x] **Parte 1 — Fundação**: protocolo binário completo em C# e em Kotlin (`android/`), testado contra os mesmos vetores
 - [x] **App Android e host de desenvolvimento** — app Compose descobre o PC (mDNS) ou aceita IP, faz o handshake e mostra a latência real (PING/PONG); `ScreenShare.DevHost` é o stub do lado do PC (sem vídeo)
-- [x] **Pareamento e autenticação** — QR + TLS com certificado fixo, no Wi-Fi e no cabo USB (protocolo v2)
+- [x] **Pareamento e autenticação** — protocolo v2 (11 mensagens, com `PAIR`, `PAIRED`, `AUTH` e `DENIED`): QR + TLS com certificado fixo
 - [x] **Parte 2** — Monitor virtual: o DevHost instala o [Virtual Display Driver](https://github.com/VirtualDrivers/Virtual-Display-Driver) e liga um monitor na resolução do celular quando ele conecta
-- [ ] **Parte 3** — Vídeo ponta a ponta no Wi-Fi + descoberta mDNS + overlay de latência
-- [ ] **Parte 4** — Conexão por cabo USB (`adb reverse`)
+- [ ] **Parte 3** — Vídeo ponta a ponta no Wi-Fi e no cabo + overlay de latência (a descoberta mDNS já existe)
+- [x] **Parte 4** — Conexão por cabo USB: porta 38701 via `adb reverse`, com o mesmo TLS e pareamento do Wi-Fi (dá para parear pelo cabo)
 - [ ] **Parte 5** — Toque multitouch
 - [ ] **Parte 6** — Robustez e UX (reconexão, bandeja, qualidade)
 
@@ -91,7 +92,26 @@ Para rodar sem monitor virtual: `dotnet run --project host/ScreenShare.DevHost -
 dotnet run --project host/ScreenShare.DevHost -- uninstall-driver
 ~~~
 
-No console, digite `p` para mostrar o QR de pareamento e escaneie com o app (botão **Parear pelo Wi-Fi (QR)** ou **Parear pelo cabo USB (QR)**). `l` lista os celulares pareados e `r <id>` remove um. Dá para parear de duas formas: pelo Wi-Fi (botão **Parear pelo Wi-Fi (QR)**) ou pelo cabo (rode `adb reverse tcp:38701 tcp:38701` e use **Parear pelo cabo USB (QR)**, com o mesmo QR). Depois de pareado, **Conectar por cabo USB** usa o cabo (com o `adb reverse` ativo) e **Parear de novo (QR)** refaz o pareamento. Sem pareamento, o botão do cabo não aparece.
+Comandos do console do DevHost:
+
+| Tecla | Ação |
+|---|---|
+| `p` | Mostra o QR de pareamento (vale 2 minutos, uma vez) |
+| `l` | Lista os celulares pareados |
+| `r <id>` | Remove um celular pareado |
+
+No app, escaneie o QR por um dos dois caminhos:
+
+- **Parear pelo Wi-Fi (QR)**: celular e PC na mesma rede.
+- **Parear pelo cabo USB (QR)**: celular no cabo, com depuração USB ligada e o túnel do adb aberto (veja abaixo).
+
+Depois de pareado, o app conecta pelo Wi-Fi (o PC aparece na lista) ou por **Conectar por cabo USB**. **Parear de novo (QR)** refaz o pareamento. Sem pareamento, o cabo não conecta.
+
+Para abrir o túnel do cabo no PowerShell (o `adb` vem com o Android Studio):
+
+```powershell
+& "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe" reverse tcp:38701 tcp:38701
+```
 
 App Android (usa o JDK do Android Studio):
 
