@@ -191,3 +191,25 @@ Manuais, no PC do usuário, ao fim do plano:
 - Bandeja e escolha de resolução ou qualidade (Parte 6).
 - HDR, taxas acima de 60 Hz e mais de um monitor virtual.
 - Escolher a posição do monitor: o Windows decide na primeira vez e depois lembra o arranjo que o usuário fizer.
+
+## Resultados do spike (2026-10-04, PC do usuário: Windows 11 26200, RTX 5060 Ti, monitor Samsung LC34G55T 3440×1440)
+
+| # | Experimento | Resultado |
+|---|---|---|
+| E1 | Instalar via SetupAPI (`DIF_REGISTERDEVICE` + `UpdateDriverForPlugAndPlayDevicesW`) | ✅ Instalou com `ok=True`, `reboot=False`, pacote `oem288.inf` e dispositivo `ROOT\DISPLAY\0000` com status OK. O monitor (1920×1080, count 1) apareceu à direita do principal, em (3440,0), sem virar o principal. A confirmação do Windows apareceu, e a caixa "Sempre confiar em software de SignPath Foundation" vem marcada, então o certificado (impressão `3CF8CF26D8BA266C3A483AB7D26D4A818E317D76`) **foi gravado em `TrustedPublisher`** pela própria instalação. |
+| E2 | `PING` / `GETSETTINGS` pelo pipe, sem admin | Conecta em ~2 ms, mas a resposta vem vazia (0 bytes). Serve no máximo para saber se o driver está vivo. |
+| E3 | Identificar o VDD | Adaptador `EnumDisplayDevices`: `DeviceString = "Virtual Display Driver"`, `DeviceID = "Root\MttVDD"`. Monitor `MONITOR\MTT1337\…`. CCD: alvo "VDD by MTT", adaptador `\?\ROOT#DISPLAY#0000#…`. **O nome GDI (`\.\DISPLAYn`) muda a cada reinício do driver** (5 → 6 → 7 → … → 11): é preciso procurá-lo sempre pelo `DeviceID`. |
+| E4 | `SETDISPLAYCOUNT 0` | ❌ Grava `count 0` no XML e **derruba o processo do driver** (WUDFHost novo). O monitor **continua lá** depois que o driver volta. |
+| E5 | Resolução nova (2400×1080) no XML | `RELOAD_DRIVER` torna o modo disponível em menos de 1 s, mas **derrubando o processo do driver**. Na 6ª queda da sessão, o Windows **desabilitou o dispositivo** (status `Error`). ✅ `pnputil /restart-device ROOT\DISPLAY\0000` (admin, 147 ms) recuperou o dispositivo e releu o XML com o modo novo. |
+| E6 | `ChangeDisplaySettingsEx` com 0×0 (`detach`) e com posição e tamanho (`attach`), sem admin | ✅ Cada operação leva ~130 ms. **10 ciclos sem falha**, mesmo processo do driver, dispositivo OK. |
+| E7 | Aplicar 2400×1080 com `ChangeDisplaySettingsEx`, sem admin | ✅ |
+| E8 | Escala via `DisplayConfigGetDeviceInfo(-3)` / `DisplayConfigSetDeviceInfo(-4)`, sem admin | ✅ Recomendada 100% (`min 0`), máximo informado 175% (`max 3`); pedir 200% (rel 4) foi aceito. Depois de o usuário escolher 150% em Configurações › Tela, a leitura deu 150%. |
+
+### Decisões tomadas a partir do spike
+
+- **Ligar e desligar:** pelo Windows (`detach`/`attach` com `ChangeDisplaySettingsEx`), sem admin. O pipe do VDD **não é usado** para nada. Os comandos dele derrubam o driver, e quedas repetidas fazem o Windows desabilitá-lo.
+- **O driver fica sempre com count 1.** Count 0 não tira o monitor. "Desligado" significa monitor desanexado da área de trabalho.
+- **Resolução nova:** o XML é editado sem admin (a pasta dá Modify ao usuário). O driver só relê ao reiniciar o dispositivo, o que exige admin. Por isso, **na primeira vez de uma resolução nova, o host pede UAC** e roda o próprio executável no modo `restart-driver`, que chama `pnputil /restart-device` para o dispositivo `Root\MttVDD`. Isso acontece uma vez por resolução. Enquanto isso, a sessão usa o modo mais próximo disponível, e na próxima conexão a resolução exata já existe.
+- **Achar a saída:** sempre por `EnumDisplayDevices` com `DeviceID = Root\MttVDD`, nunca guardando o `\.\DISPLAYn`.
+- **Escala:** limitada também ao máximo que o Windows informa para o monitor (`recomendada + max`). Num monitor sem tamanho físico, esse máximo deu 175%.
+- **Certificado:** o instalador anota se o certificado do editor do `.cat` já estava em `TrustedPublisher` e, **se não estava, remove-o depois de instalar**. O driver instalado não depende dele.
