@@ -687,7 +687,7 @@ git push
 
 ### Task 3: instalação do driver (`install-driver`, `uninstall-driver`, `restart-driver`)
 
-> **Nota da execução (revisão da Task 3):** o código final difere deste texto em cinco pontos corrigidos na revisão: a constante de `TRUST_NOT_ESTABLISHED` (0xE0000242, já corrigida abaixo); o catálogo lido antes de instalar; dispositivo sem driver não conta como instalado e é removido antes de criar outro; `restart-driver` sem dispositivo devolve erro; `ElevatedCommand` não lança e não reabre o `dotnet.exe` (`CanRelaunch`). Veja o commit `53f3577`.
+> **Nota da execução (revisão da Task 3):** o código final difere deste texto em cinco pontos corrigidos na revisão: a constante de `TRUST_NOT_ESTABLISHED` (0xE0000242, já corrigida abaixo); o catálogo lido antes de instalar; dispositivo sem driver não conta como instalado e é removido antes de criar outro; `restart-driver` sem dispositivo devolve erro; `ElevatedCommand` não lança e não reabre o `dotnet.exe` (`CanRelaunch`). Veja o commit `53f3577`. Depois, a instalação manual mostrou uma sexta: o XML e as permissões passam a ser preparados **antes** de instalar o dispositivo, porque o driver lê o XML assim que sobe (commit `4f6790a`).
 
 **Files:**
 - Modify: `host/ScreenShare.Display/ScreenShare.Display.csproj` (pacote `System.Security.Cryptography.Pkcs`)
