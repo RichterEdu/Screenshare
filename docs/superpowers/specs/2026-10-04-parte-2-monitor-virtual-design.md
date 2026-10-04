@@ -28,6 +28,19 @@ Uso pessoal: um PC com Windows 11 e um celular do mesmo dono.
 
 O processo do driver (UMDF) grava no XML quando recebe `SETDISPLAYCOUNT`. Por isso, o XML precisa poder ser escrito também pela conta do serviço, e não só pelo usuário.
 
+**Achado ao preparar o plano (2026-10-04):**
+- O zip `VirtualDisplayDriver-x86.Driver.Only.zip` do release 25.7.23 traz o **driver 24.12.24**:
+  - DLL x64;
+  - `DriverVer = 12/24/2024,11.30.4.434`;
+  - SHA-256 do zip `e24210692b442b39af763536330ce78b423f19342b7a7792c26de3944e418b3a`, conforme o GitHub e conferido localmente.
+- No código desse driver (tag 24.12.24):
+  - **Leitura do XML:** o `loadSettings()` (número de monitores e lista de modos) só roda quando o dispositivo inicia.
+  - **`RELOAD_DRIVER` e `SETDISPLAYCOUNT`:** os dois só chamam `InitAdapter()`, depois de pegar o contexto WDF a partir do *handle do pipe*. Na prática, ou não fazem nada ou derrubam o processo do driver, e o Windows o reinicia.
+- O controle em tempo de uso pelo pipe é, portanto, **duvidoso**. O spike decide o mecanismo de ligar/desligar e de acrescentar modos. Os candidatos sem administrador são:
+  - desligar e religar o monitor pelo Windows: CCD/`ChangeDisplaySettingsEx`, como o "Desconectar este monitor";
+  - para resoluções novas, reiniciar o dispositivo, o que exige administrador. Isso acontece uma vez por resolução nova.
+- As tarefas do plano que dependem disso são escritas depois do spike.
+
 ## Componentes
 
 Projeto novo: **`host/ScreenShare.Display`** (`net10.0-windows`). O `ScreenShare.DevHost` e o `ScreenShare.Tests` passam a ser `net10.0-windows` e a referenciá-lo. O `ScreenShare.Core` não muda.
