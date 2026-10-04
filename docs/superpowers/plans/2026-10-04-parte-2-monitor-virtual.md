@@ -3009,11 +3009,12 @@ git push
 - Create: `host/ScreenShare.DevHost/MonitorSetup.cs`
 - Modify: `host/ScreenShare.DevHost/HostServer.cs` (construtor e `ServeSessionAsync`)
 - Modify: `host/ScreenShare.DevHost/Program.cs` (criar o gerenciador e passar ao servidor)
-- Test: `host/ScreenShare.Tests/DevHost/HostServerTests.cs` (gerenciador falso e testes novos), `host/ScreenShare.Tests/DevHost/MonitorSetupTests.cs`
+- Modify: `host/ScreenShare.Display/VirtualMonitorManager.cs` (acerto também quando o reinício não acontece; emenda do controlador)
+- Test: `host/ScreenShare.Tests/DevHost/HostServerTests.cs` (gerenciador falso e testes novos), `host/ScreenShare.Tests/DevHost/MonitorSetupTests.cs`, `host/ScreenShare.Tests/Display/VirtualMonitorManagerTests.cs` (+1)
 
 **Interfaces:**
 - Consumes:
-  - `IVirtualMonitorManager`, `VirtualMonitorLease`, `MonitorRequest`, `VirtualMonitor`, `NullVirtualMonitorManager`, `VirtualMonitorManager`, `IDriverRestarter` (Task 5);
+  - `IVirtualMonitorManager`, `VirtualMonitorLease`, `MonitorRequest`, `VirtualMonitor`, `NullVirtualMonitorManager`, `VirtualMonitorManager` (com `SettleAfterRestart`, da revisão da Task 5), `IDriverRestarter` (Task 5);
   - `DisplayTopology` (Task 4);
   - `WindowsDriverSystem`, `ElevatedCommand`, `DriverExitCode` (Task 3);
   - `DriverCommands.Describe` (Task 3);
@@ -3245,6 +3246,62 @@ public static class MonitorSetup
 }
 ```
 
+- [ ] **Step 3b: o gerenciador acerta o monitor também quando o reinício não acontece (emenda do controlador)**
+
+O `ElevatedDriverRestarter` devolve `false` quando o processo elevado sai com código diferente de 0. Isso inclui o `pnputil` falhar depois de já ter reiniciado o dispositivo, e aí o Windows pode religar a saída sem ninguém conectado. Acertar é sempre seguro: se nada mudou, `SettleAfterRestart` não faz nada.
+
+Em `host/ScreenShare.Tests/Display/VirtualMonitorManagerTests.cs`, acrescente:
+
+```csharp
+    [Fact]
+    public async Task Failed_restart_still_settles_the_monitor()
+    {
+        var restart = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        _restarter = new FakeRestarter(() => restart.Task);
+        using var manager = Create();
+        manager.Acquire(2400, 1080, 420).Dispose();
+        _time.Advance(TimeSpan.FromSeconds(11));
+
+        _topology.Attached = true; // o pnputil falhou, mas o driver chegou a reiniciar e o Windows religou a saída
+        restart.SetResult(false);
+        await manager.PendingRestart;
+
+        Assert.False(_topology.Attached);
+    }
+```
+
+Run: `dotnet test host/ScreenShare.slnx --filter FullyQualifiedName~Failed_restart_still_settles_the_monitor`
+Expected: FAIL (`Assert.False() Failure`, o monitor fica ligado).
+
+Em `host/ScreenShare.Display/VirtualMonitorManager.cs`, acrescente ao lado de `SettleAfterRestart`:
+
+```csharp
+    /// <summary><see cref="SettleAfterRestart"/> tomando a trava (para os caminhos fora dela).</summary>
+    private void SettleUnderLock(MonitorRequest request)
+    {
+        lock (_gate)
+        {
+            if (!_disposed) SettleAfterRestart(request);
+        }
+    }
+```
+
+e, em `RestartThenApplyAsync`:
+1. no `catch` em volta de `_restarter.RestartAsync()`, chame `SettleUnderLock(request);` depois do `_log(...)` e antes do `return;`;
+2. no `if (!restarted)`, troque o corpo por:
+
+```csharp
+            _log($"O driver não foi reiniciado; {request.Width}×{request.Height} fica para a próxima execução do host.");
+            // O reinício pode ter acontecido em parte (o pnputil falhou depois de reiniciar): acerta do mesmo jeito.
+            SettleUnderLock(request);
+            return;
+```
+
+3. no ramo do prazo, troque o bloco `lock (_gate) { if (!_disposed) SettleAfterRestart(request); }` por `SettleUnderLock(request);`.
+
+Run: `dotnet test host/ScreenShare.slnx --filter FullyQualifiedName~VirtualMonitorManagerTests`
+Expected: PASS (30 casos).
+
 - [ ] **Step 4: `Program.cs`**
 
 Em `host/ScreenShare.DevHost/Program.cs`:
@@ -3274,7 +3331,7 @@ Console.WriteLine(monitors is null
 Como o `using var monitors` vem antes do `using var server`, o servidor é descartado primeiro e o monitor é desligado por último, inclusive no Ctrl+C.
 
 Run: `dotnet build host/ScreenShare.slnx` e `dotnet test host/ScreenShare.slnx`
-Expected: 0 avisos; todos passam (os 4 testes novos do `HostServer` e os 8 do `MonitorSetupTests` incluídos).
+Expected: 0 avisos; 222 aprovados + 1 ignorado (209 de antes + 4 do `HostServer` + 8 do `MonitorSetupTests` + 1 do `VirtualMonitorManagerTests`).
 
 - [ ] **Step 5: Commit e push**
 
