@@ -8,8 +8,8 @@ using ScreenShare.Core.Security;
 namespace ScreenShare.DevHost;
 
 /// <summary>
-/// Servidor de desenvolvimento (sem vídeo). Porta Wi-Fi: TLS obrigatório, depois PAIR/AUTH antes do HELLO.
-/// Porta USB: só em loopback (o `adb reverse` chega por ali), HELLO direto. Responde PING com PONG.
+/// Servidor de desenvolvimento (sem vídeo). As duas portas exigem TLS e depois PAIR/AUTH antes do HELLO.
+/// A porta USB escuta só em loopback (o `adb reverse` chega por ali). Responde PING com PONG.
 /// Atende um cliente por vez em cada porta; um cliente mudo é derrubado por prazo (handshake e ociosidade).
 /// </summary>
 public sealed class HostServer : IDisposable
@@ -28,7 +28,7 @@ public sealed class HostServer : IDisposable
     private readonly TimeSpan _handshakeTimeout;
     private readonly TimeSpan _idleTimeout;
 
-    /// <param name="handshakeTimeout">Prazo para TLS + PAIR/AUTH na porta Wi-Fi (padrão 10 s).</param>
+    /// <param name="handshakeTimeout">Prazo para TLS + PAIR/AUTH em qualquer porta (padrão 10 s).</param>
     /// <param name="idleTimeout">
     /// Silêncio máximo numa sessão, em qualquer porta (padrão 10 s). O app manda PING a cada segundo,
     /// então 10 s sem nada é conexão morta (celular sem Wi-Fi, fora de alcance) e não pode prender a porta.
@@ -60,10 +60,10 @@ public sealed class HostServer : IDisposable
 
     /// <summary>Atende as duas portas até o token ser cancelado.</summary>
     public Task RunAsync(CancellationToken cancellationToken) => Task.WhenAll(
-        AcceptLoopAsync(_wifi, secure: true, cancellationToken),
-        AcceptLoopAsync(_usb, secure: false, cancellationToken));
+        AcceptLoopAsync(_wifi, "Wi-Fi", cancellationToken),
+        AcceptLoopAsync(_usb, "USB", cancellationToken));
 
-    private async Task AcceptLoopAsync(TcpListener listener, bool secure, CancellationToken cancellationToken)
+    private async Task AcceptLoopAsync(TcpListener listener, string portLabel, CancellationToken cancellationToken)
     {
         try
         {
@@ -73,11 +73,8 @@ public sealed class HostServer : IDisposable
                 try
                 {
                     client.NoDelay = true;
-                    _log?.Invoke($"Cliente conectado ({(secure ? "Wi-Fi" : "USB")}): {client.Client.RemoteEndPoint}");
-                    if (secure)
-                        await ServeWifiAsync(client.GetStream(), cancellationToken);
-                    else
-                        await ServeSessionAsync(client.GetStream(), new MessageReader(client.GetStream()), cancellationToken);
+                    _log?.Invoke($"Cliente conectado ({portLabel}): {client.Client.RemoteEndPoint}");
+                    await ServeSecureAsync(client.GetStream(), cancellationToken);
                 }
                 catch (Exception e) when (!(e is OperationCanceledException && cancellationToken.IsCancellationRequested))
                 {
@@ -94,7 +91,7 @@ public sealed class HostServer : IDisposable
         }
     }
 
-    private async Task ServeWifiAsync(NetworkStream network, CancellationToken cancellationToken)
+    private async Task ServeSecureAsync(NetworkStream network, CancellationToken cancellationToken)
     {
         await using var tls = new SslStream(network, leaveInnerStreamOpen: false);
         // TLS e PAIR/AUTH precisam terminar dentro do prazo: um cliente calado não pode prender a porta.

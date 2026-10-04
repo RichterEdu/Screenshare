@@ -4,7 +4,7 @@ using QRCoder;
 using ScreenShare.Core.Security;
 using ScreenShare.DevHost;
 
-// Host de desenvolvimento: Wi-Fi com TLS + pareamento por QR (porta 38700) e USB sem TLS em loopback (porta 38701).
+// Host de desenvolvimento: Wi-Fi com TLS + pareamento por QR (porta 38700) e USB com TLS + pareamento, só em loopback (porta 38701).
 // Comandos no console: p = parear celular (mostra o QR), l = listar pareados, r <id> = remover, Ctrl+C = sair.
 const int WifiPort = 38700;
 const int UsbPort = 38701;
@@ -35,7 +35,7 @@ profile.AddProperty("fp", identity.MdnsId);
 using var discovery = new ServiceDiscovery();
 discovery.Advertise(profile);
 
-Console.WriteLine($"ScreenShare DevHost \"{Environment.MachineName}\": Wi-Fi (TLS) na porta {server.WifiPort}, USB na {server.UsbEndPoint}.");
+Console.WriteLine($"ScreenShare DevHost \"{Environment.MachineName}\": Wi-Fi (TLS) na porta {server.WifiPort}, USB (TLS, só loopback) na {server.UsbEndPoint}.");
 Console.WriteLine($"IPs anunciados: {(lanAddresses.Count > 0 ? string.Join(", ", lanAddresses) : "todos")}. Digital: {identity.Fingerprint}");
 Console.WriteLine("Comandos: p = parear celular, l = listar pareados, r <id> = remover, Ctrl+C = sair.");
 

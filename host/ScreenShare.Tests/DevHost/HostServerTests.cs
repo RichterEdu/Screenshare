@@ -45,11 +45,11 @@ public sealed class HostServerTests : IAsyncLifetime
     private static HelloMessage Hello(ushort version = MessageCodec.ProtocolVersion) =>
         new(version, 2400, 1080, 420, VideoCodec.H264 | VideoCodec.H265);
 
-    /// <summary>TLS na porta Wi-Fi, aceitando só o certificado do PC de teste (como o celular faz).</summary>
-    private async Task<(TcpClient Client, SslStream Stream, MessageReader Reader)> ConnectWifiAsync()
+    /// <summary>TLS numa porta do servidor, aceitando só o certificado do PC de teste (como o celular faz).</summary>
+    private async Task<(TcpClient Client, SslStream Stream, MessageReader Reader)> ConnectSecureAsync(int port)
     {
         var client = new TcpClient();
-        await client.ConnectAsync(IPAddress.Loopback, _server.WifiPort, _cts.Token);
+        await client.ConnectAsync(IPAddress.Loopback, port, _cts.Token);
         var tls = new SslStream(client.GetStream());
         await tls.AuthenticateAsClientAsync(new SslClientAuthenticationOptions
         {
@@ -60,12 +60,19 @@ public sealed class HostServerTests : IAsyncLifetime
         return (client, tls, new MessageReader(tls));
     }
 
-    private async Task<(TcpClient Client, NetworkStream Stream, MessageReader Reader)> ConnectUsbAsync()
+    private Task<(TcpClient Client, SslStream Stream, MessageReader Reader)> ConnectWifiAsync() =>
+        ConnectSecureAsync(_server.WifiPort);
+
+    private Task<(TcpClient Client, SslStream Stream, MessageReader Reader)> ConnectUsbAsync() =>
+        ConnectSecureAsync(_server.UsbEndPoint.Port);
+
+    /// <summary>Conecta na porta USB (TLS) e já manda o AUTH de um aparelho recém-adicionado.</summary>
+    private async Task<(TcpClient Client, SslStream Stream, MessageReader Reader)> ConnectUsbAuthedAsync()
     {
-        var client = new TcpClient();
-        await client.ConnectAsync(IPAddress.Loopback, _server.UsbEndPoint.Port, _cts.Token);
-        var stream = client.GetStream();
-        return (client, stream, new MessageReader(stream));
+        var (_, token) = _devices.Add("Pixel 8");
+        var connection = await ConnectUsbAsync();
+        await SendAsync(connection.Stream, new AuthMessage(token));
+        return connection;
     }
 
     private Task SendAsync(Stream stream, Message message) =>
@@ -221,9 +228,9 @@ public sealed class HostServerTests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task Usb_port_serves_hello_without_tls_or_pairing()
+    public async Task Usb_port_requires_tls_and_auth_then_serves_hello()
     {
-        var (client, stream, reader) = await ConnectUsbAsync();
+        var (client, stream, reader) = await ConnectUsbAuthedAsync();
         using var _ = client;
 
         await SendAsync(stream, Hello());
@@ -234,13 +241,61 @@ public sealed class HostServerTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task Usb_port_rejects_plain_tcp_hello()
+    {
+        using (var plain = new TcpClient())
+        {
+            await plain.ConnectAsync(IPAddress.Loopback, _server.UsbEndPoint.Port, _cts.Token);
+            await plain.GetStream().WriteAsync(MessageCodec.Encode(Hello()), _cts.Token);
+            Message? reply = null;
+            var error = await Record.ExceptionAsync(async () => reply = await new MessageReader(plain.GetStream()).ReadAsync(_cts.Token));
+            Assert.Null(reply);
+            Assert.True(error is null or IOException, $"erro inesperado: {error}");
+        }
+
+        // a porta continua servindo um cliente de verdade
+        var (client, stream, reader) = await ConnectUsbAuthedAsync();
+        using var _ = client;
+        await SendAsync(stream, Hello());
+        Assert.IsType<ConfigMessage>(await reader.ReadAsync(_cts.Token));
+    }
+
+    [Fact]
+    public async Task Usb_port_denies_hello_without_auth()
+    {
+        var (client, stream, reader) = await ConnectUsbAsync();
+        using var _ = client;
+
+        await SendAsync(stream, Hello());
+
+        Assert.Equal(new DeniedMessage(DeniedReason.UnknownDevice), await reader.ReadAsync(_cts.Token));
+        await AssertClosedAsync(reader);
+    }
+
+    [Fact]
+    public async Task Pairing_over_usb_works()
+    {
+        var secret = _pairing.Begin();
+        var (client, stream, reader) = await ConnectUsbAsync();
+        using var _ = client;
+
+        await SendAsync(stream, new PairMessage(secret, "Pixel 8"));
+        var token = Assert.IsType<PairedMessage>(await reader.ReadAsync(_cts.Token)).Token;
+        await SendAsync(stream, new AuthMessage(token));
+        await SendAsync(stream, Hello());
+
+        Assert.IsType<ConfigMessage>(await reader.ReadAsync(_cts.Token));
+        Assert.Equal("Pixel 8", Assert.Single(_devices.Devices).Name);
+    }
+
+    [Fact]
     public void Usb_port_listens_only_on_loopback() =>
         Assert.Equal(IPAddress.Loopback, _server.UsbEndPoint.Address);
 
     [Fact]
     public async Task Old_app_hello_v1_on_usb_is_denied_with_incompatible_version()
     {
-        var (client, stream, reader) = await ConnectUsbAsync();
+        var (client, stream, reader) = await ConnectUsbAuthedAsync();
         using var _ = client;
 
         await SendAsync(stream, Hello(version: 1));
@@ -292,7 +347,7 @@ public sealed class HostServerTests : IAsyncLifetime
     [Fact]
     public async Task Silent_client_after_config_is_dropped_after_the_idle_timeout_and_a_new_one_is_served()
     {
-        var (silent, silentStream, silentReader) = await ConnectUsbAsync();
+        var (silent, silentStream, silentReader) = await ConnectUsbAuthedAsync();
         using (silent)
         {
             await SendAsync(silentStream, Hello());
@@ -301,7 +356,7 @@ public sealed class HostServerTests : IAsyncLifetime
             await AssertClosedAsync(silentReader); // o aparelho sumiu: sem nada por 2 s, o PC derruba a conexão
         }
 
-        var (client, stream, reader) = await ConnectUsbAsync();
+        var (client, stream, reader) = await ConnectUsbAuthedAsync();
         using var _ = client;
         await SendAsync(stream, Hello());
 
@@ -311,12 +366,12 @@ public sealed class HostServerTests : IAsyncLifetime
     [Fact]
     public async Task Server_accepts_a_new_usb_client_after_the_previous_one_disconnects()
     {
-        var first = await ConnectUsbAsync();
+        var first = await ConnectUsbAuthedAsync();
         await SendAsync(first.Stream, Hello());
         Assert.IsType<ConfigMessage>(await first.Reader.ReadAsync(_cts.Token));
         first.Client.Dispose();
 
-        var (client, stream, reader) = await ConnectUsbAsync();
+        var (client, stream, reader) = await ConnectUsbAuthedAsync();
         using var _ = client;
         await SendAsync(stream, Hello());
 
