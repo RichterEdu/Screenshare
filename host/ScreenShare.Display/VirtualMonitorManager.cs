@@ -189,11 +189,14 @@ public sealed class VirtualMonitorManager : IVirtualMonitorManager, IDisposable
         catch (Exception e)
         {
             _log($"Falha ao reiniciar o driver de monitor virtual: {e.Message}");
+            SettleUnderLock(request);
             return;
         }
         if (!restarted)
         {
             _log($"O driver não foi reiniciado; {request.Width}×{request.Height} fica para a próxima execução do host.");
+            // O reinício pode ter acontecido em parte (o pnputil falhou depois de reiniciar): acerta do mesmo jeito.
+            SettleUnderLock(request);
             return;
         }
 
@@ -230,10 +233,7 @@ public sealed class VirtualMonitorManager : IVirtualMonitorManager, IDisposable
             if (_time.GetUtcNow() >= deadline)
             {
                 _log($"O driver reiniciou, mas {request.Width}×{request.Height} não apareceu.");
-                lock (_gate)
-                {
-                    if (!_disposed) SettleAfterRestart(request);
-                }
+                SettleUnderLock(request);
                 return;
             }
             await Task.Delay(PollInterval, _time);
@@ -255,6 +255,15 @@ public sealed class VirtualMonitorManager : IVirtualMonitorManager, IDisposable
         catch (Exception e)
         {
             _log($"Falha ao acertar o monitor virtual depois do reinício: {e.Message}");
+        }
+    }
+
+    /// <summary><see cref="SettleAfterRestart"/> tomando a trava (para os caminhos fora dela).</summary>
+    private void SettleUnderLock(MonitorRequest request)
+    {
+        lock (_gate)
+        {
+            if (!_disposed) SettleAfterRestart(request);
         }
     }
 

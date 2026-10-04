@@ -205,6 +205,22 @@ public sealed class VirtualMonitorManagerTests : IDisposable
     }
 
     [Fact]
+    public async Task Failed_restart_still_settles_the_monitor()
+    {
+        var restart = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        _restarter = new FakeRestarter(() => restart.Task);
+        using var manager = Create();
+        manager.Acquire(2400, 1080, 420).Dispose();
+        _time.Advance(TimeSpan.FromSeconds(11));
+
+        _topology.Attached = true; // o pnputil falhou, mas o driver chegou a reiniciar e o Windows religou a saída
+        restart.SetResult(false);
+        await manager.PendingRestart;
+
+        Assert.False(_topology.Attached);
+    }
+
+    [Fact]
     public async Task Restart_finishing_with_nobody_connected_leaves_the_monitor_off()
     {
         var restart = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);

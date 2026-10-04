@@ -3,6 +3,7 @@ using Makaretu.Dns;
 using QRCoder;
 using ScreenShare.Core.Security;
 using ScreenShare.DevHost;
+using ScreenShare.Display;
 
 // Host de desenvolvimento: Wi-Fi com TLS + pareamento por QR (porta 38700) e USB com TLS + pareamento, só em loopback (porta 38701).
 // Comandos no console: p = parear celular (mostra o QR), l = listar pareados, r <id> = remover, Ctrl+C = sair.
@@ -20,6 +21,9 @@ if (identity is null) return 1;
 var pairing = new PairingSession(TimeProvider.System);
 var devices = new DeviceRegistry(Path.Combine(dataDirectory, "paired-devices.json"), log: Log);
 
+// Monitor virtual: liga quando um celular conecta (--sem-monitor desliga o recurso e não mexe no driver).
+using var monitors = args.Contains("--sem-monitor") ? null : MonitorSetup.Create(Log);
+
 using var cts = new CancellationTokenSource();
 Console.CancelKeyPress += (_, e) =>
 {
@@ -27,7 +31,7 @@ Console.CancelKeyPress += (_, e) =>
     cts.Cancel();
 };
 
-using var server = new HostServer(WifiPort, UsbPort, identity, pairing, devices, Log);
+using var server = new HostServer(WifiPort, UsbPort, identity, pairing, devices, Log, monitors: monitors);
 server.Start();
 
 // Anuncia só IPs da LAN real; sem nenhum (ex.: sem gateway), cai no padrão da biblioteca (todos os IPs).
@@ -40,6 +44,9 @@ discovery.Advertise(profile);
 
 Console.WriteLine($"ScreenShare DevHost \"{Environment.MachineName}\": Wi-Fi (TLS) na porta {server.WifiPort}, USB (TLS, só loopback) na {server.UsbEndPoint}.");
 Console.WriteLine($"IPs anunciados: {(lanAddresses.Count > 0 ? string.Join(", ", lanAddresses) : "todos")}. Digital: {identity.Fingerprint}");
+Console.WriteLine(monitors is null
+    ? "Monitor virtual: desligado (sem driver ou --sem-monitor); o CONFIG leva a resolução do celular."
+    : "Monitor virtual: pronto; liga quando um celular conecta e sai da área de trabalho 10 s depois que ele desconecta.");
 Console.WriteLine("Comandos: p = parear celular, l = listar pareados, r <id> = remover, Ctrl+C = sair.");
 
 // Uma falha num comando (ex.: erro de disco ao remover um celular) não pode encerrar o laço: p/l/r continuam respondendo.
