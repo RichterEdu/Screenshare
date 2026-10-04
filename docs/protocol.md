@@ -26,9 +26,9 @@ A sequência é a mesma na 38700 (Wi-Fi) e na 38701 (USB, com o QR conectando em
 - **Primeiro uso — pareamento pelo QR:** TLS → `PAIR` → `PAIRED` → `AUTH` → `HELLO` → `CONFIG`.
 - **Já pareado:** TLS → `AUTH` → `HELLO` → `CONFIG`.
 
-Depois do `AUTH`, 10 s sem nenhuma mensagem do celular fecham a conexão (o app envia `PING` a cada segundo).
+Depois do `AUTH`, 10 s sem nenhuma mensagem do celular fecham a conexão (o app envia `PING` a cada segundo). Depois do `CONFIG`, o PC também envia um `PING` a cada segundo (ver "Vídeo").
 
-Depois do `CONFIG`: o PC envia `FRAME`s (o primeiro é keyframe) e, a qualquer momento, vêm `TOUCH`, `PING`/`PONG`, `KEYFRAME_REQ`.
+Depois do `CONFIG`: o PC envia `FRAME`s (o primeiro é keyframe) e, a qualquer momento, vêm `TOUCH`, `PING`/`PONG`, `KEYFRAME_REQ` e, se o vídeo mudar (resolução, encoder, codec), um `CONFIG` novo. As regras estão em "Vídeo".
 
 Regras:
 - Nas duas portas (38700 e 38701) a primeira mensagem tem de ser `PAIR` ou `AUTH`; depois de `PAIR`/`PAIRED` vem `AUTH`. Qualquer outra coisa (inclusive `HELLO` direto) → `DENIED(2)` e fechamento.
@@ -89,6 +89,8 @@ Cada ponteiro: `id` u8, `action` u8 (0 DOWN, 1 MOVE, 2 UP, 3 CANCEL), `x` f32, `
 ### PING / PONG
 `timestampUs` u64: valor opaco de quem enviou o PING. O PONG devolve o mesmo valor e o remetente calcula o RTT com o próprio relógio.
 
+O PING que o **PC** envia (a cada segundo depois do `CONFIG`) leva o relógio do PC em µs: monotônico e o mesmo relógio do `FRAME.timestampUs`, lido no instante em que o PING é escrito. O celular **deve** responder cada PING do PC com um PONG de mesmo valor, sem demora; com isso e com o próprio RTT, ele converte o horário de captura dos quadros para o próprio relógio e mede a latência de ponta a ponta.
+
 ### KEYFRAME_REQ
 Sem payload. O celular pede um keyframe depois de um erro de decodificação.
 
@@ -114,6 +116,12 @@ Sem payload. O celular pede um keyframe depois de um erro de decodificação.
 |---|---|---|
 | reason | u8 | 1 = segredo inválido, expirado ou usado; 2 = aparelho não pareado ou removido; 3 = versão incompatível |
 
+## Vídeo
+- **CONFIG:** o primeiro pode chegar até cerca de 2 s depois do `HELLO` (o PC espera o primeiro keyframe para tirar os parâmetros dele). Pode ser reenviado no meio da sessão, quando a resolução, o encoder ou o codec mudam. **Depois de qualquer `CONFIG`, o próximo `FRAME` é keyframe**, e nenhum quadro do stream anterior é enviado depois dele. Um `CONFIG` com o mesmo conteúdo do anterior permite manter o decoder.
+- **codecConfig:** quando não vazio, contém só os parâmetros (H.264: SPS e PPS; H.265: VPS, SPS e PPS), cada um com start code de 4 bytes. Eles também se repetem dentro de cada keyframe.
+- **FRAME:** um access unit por mensagem. Keyframe = IDR (H.264: NAL tipo 5; H.265: tipos 19, 20 ou 21) precedido dos parâmetros. Sem B-frames: a ordem de decodificação é a de exibição. Timestamps estritamente crescentes dentro de um stream. NALs de AUD e SEI podem aparecer e são ignoráveis.
+- **Fluxo:** quadros só quando a tela muda, mais alguns refinamentos logo depois que ela para; ficar sem quadros é normal. Com congestionamento o PC pode pular quadros, mas o próximo que chega depois de um pulo é keyframe. `KEYFRAME_REQ` é atendido o quanto antes, mesmo com a tela parada; pedidos próximos são juntados.
+
 ## Descoberta (Wi-Fi)
 O host anuncia por mDNS/DNS-SD o serviço **`_screenshare._tcp`**, com a porta TCP do protocolo (padrão 38700) e o nome da máquina como nome da instância. O app Android o encontra com o `NsdManager`; se a rede bloquear multicast, o usuário digita `IP` ou `IP:porta`. No USB não há descoberta: o app conecta em `127.0.0.1` depois do `adb reverse`. O TXT do anúncio traz `fp` = 16 primeiros caracteres hex (minúsculos) do SHA-256 do certificado do PC, para o celular reconhecer o PC pareado mesmo se o IP mudar. No USB a porta é a 38701.
 
@@ -138,3 +146,5 @@ O host anuncia por mDNS/DNS-SD o serviço **`_screenshare._tcp`**, com a porta T
 | paired.hex | PAIRED com chave A0..BF |
 | auth.hex | AUTH com chave A0..BF |
 | denied.hex | DENIED motivo 2 |
+| annexb/h264-idr.hex | access unit IDR real de H.264, 256×144, gerado pelo encoder do PC (só os dados do vídeo, sem cabeçalho de mensagem) |
+| annexb/h265-idr.hex | access unit IDR real de H.265, 256×144 (idem) |
