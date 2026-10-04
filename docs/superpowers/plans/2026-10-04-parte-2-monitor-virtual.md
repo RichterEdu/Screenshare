@@ -2132,6 +2132,8 @@ Esperado: PASS. O monitor virtual aparece e some durante o teste. Registre no re
 
 ### Task 5: `VirtualMonitorManager` (lease, contagem, desligamento em 10 s, resolução nova)
 
+> **Nota da execução (revisão da Task 5):** o código final acrescenta `SettleAfterRestart`, chamado quando a resolução nova não aparece no prazo de 5 s ou o laço de espera dá erro: com sessão, `Apply(request, shareIfInUse: true)`; sem sessão e sem desligamento agendado, `TurnOff`. Mais três testes (29 casos no total). Veja o commit `e7fdf49`.
+
 **Files:**
 - Create: `host/ScreenShare.Display/VirtualMonitor.cs`
 - Create: `host/ScreenShare.Display/VirtualMonitorManager.cs`

@@ -98,6 +98,7 @@ Projeto novo: **`host/ScreenShare.Display`** (`net10.0-windows`). O `ScreenShare
 1. O host espera até 5 s a saída voltar com a resolução nova.
 2. **Celular ainda conectado:** aplica a resolução exata e a escala (passos 5 e 6). O `CONFIG` daquela sessão já foi enviado com a resolução antiga; a Parte 2 não tem vídeo, e a Parte 3 trata a troca de tamanho como uma recaptura.
 3. **Ninguém conectado:** garante o monitor desanexado.
+4. **A resolução nova não apareceu em 5 s, ou deu erro:** o host acerta do mesmo jeito. Com celular conectado, o monitor fica ligado na resolução mais próxima (religado, se o driver voltou com ele desligado); sem ninguém conectado e sem desligamento agendado, fica desligado.
 
 ### Desconexão (fim do lease)
 
