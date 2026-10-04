@@ -29,12 +29,22 @@ public static class ElevatedCommand
     }
 
     /// <summary>
+    /// Só o executável do próprio host pode ser reaberto como administrador. Rodando como "dotnet ScreenShare.DevHost.dll",
+    /// o caminho é o do dotnet.exe, e reabri-lo não acharia o DevHost.
+    /// </summary>
+    public static bool CanRelaunch(string? processPath) =>
+        processPath is not null && !Path.GetFileNameWithoutExtension(processPath).Equals("dotnet", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
     /// Roda este executável como administrador com os argumentos dados (sem espaços: comandos e SIDs) e devolve o
-    /// código de saída. UAC recusado = <see cref="DriverExitCode.UserDeclined"/>.
+    /// código de saída. UAC recusado = <see cref="DriverExitCode.UserDeclined"/>. Se não dá para reabrir o executável
+    /// (veja <see cref="CanRelaunch"/>) ou o Windows se recusa a iniciá-lo, devolve <see cref="DriverExitCode.SetupFailed"/>.
     /// </summary>
     public static int Run(params string[] arguments)
     {
-        var start = new ProcessStartInfo(Environment.ProcessPath ?? throw new InvalidOperationException("Caminho do executável desconhecido."))
+        if (!CanRelaunch(Environment.ProcessPath)) return (int)DriverExitCode.SetupFailed;
+
+        var start = new ProcessStartInfo(Environment.ProcessPath!)
         {
             UseShellExecute = true,
             Verb = "runas",
@@ -49,6 +59,10 @@ public static class ElevatedCommand
         catch (Win32Exception e) when (e.NativeErrorCode == ErrorCancelled)
         {
             return (int)DriverExitCode.UserDeclined;
+        }
+        catch (Win32Exception)
+        {
+            return (int)DriverExitCode.SetupFailed;
         }
     }
 }

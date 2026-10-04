@@ -13,7 +13,11 @@ public sealed class WindowsDriverSystem : IDriverSystem
 {
     private static readonly HttpClient Http = new() { Timeout = TimeSpan.FromMinutes(2) };
 
-    public bool IsInstalled() => SetupApi.FindDevices(VddPackage.HardwareId, presentOnly: true).Count > 0;
+    // Nenhum dispositivo para reiniciar não é sucesso: quem pediu o reinício contava com o driver relendo o XML.
+    private const int ErrorNoSuchDevinst = unchecked((int)0xE000020B);
+
+    // Um dispositivo que ficou sem driver (instalação interrompida no meio) não conta como instalado.
+    public bool IsInstalled() => SetupApi.FindDevices(VddPackage.HardwareId, presentOnly: true).Any(device => device.InfName is not null);
 
     public Task<byte[]> DownloadAsync(Uri url, CancellationToken cancellationToken) => Http.GetByteArrayAsync(url, cancellationToken);
 
@@ -87,7 +91,10 @@ public sealed class WindowsDriverSystem : IDriverSystem
 
     public int RestartDevices()
     {
-        foreach (var device in SetupApi.FindDevices(VddPackage.HardwareId, presentOnly: true))
+        var devices = SetupApi.FindDevices(VddPackage.HardwareId, presentOnly: true);
+        if (devices.Count == 0) return ErrorNoSuchDevinst;
+
+        foreach (var device in devices)
         {
             var start = new ProcessStartInfo(Path.Combine(Environment.SystemDirectory, "pnputil.exe"))
             {

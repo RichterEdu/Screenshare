@@ -15,6 +15,11 @@ public static class DriverCommands
         var command = args[0];
         if (!ElevatedCommand.IsElevated)
         {
+            if (!ElevatedCommand.CanRelaunch(Environment.ProcessPath))
+            {
+                Console.WriteLine($"Rode com \"dotnet run --project host/ScreenShare.DevHost -- {command}\" ou pelo ScreenShare.DevHost.exe (não com \"dotnet ScreenShare.DevHost.dll\").");
+                return (int)DriverExitCode.SetupFailed;
+            }
             var code = command == "install-driver"
                 ? ElevatedCommand.Run(command, ElevatedCommand.CurrentUserSid)
                 : ElevatedCommand.Run(command);

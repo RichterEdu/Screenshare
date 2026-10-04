@@ -18,7 +18,7 @@ public sealed class DriverInstaller(IDriverSystem system, Action<string> log, st
     // Erros do Windows que significam "o usuário disse não" na confirmação de instalação do driver.
     private const int ErrorCancelled = 1223;
     private const int ErrorAuthenticodePublisherNotTrusted = unchecked((int)0xE0000243);
-    private const int ErrorAuthenticodeTrustNotEstablished = unchecked((int)0xE0000244);
+    private const int ErrorAuthenticodeTrustNotEstablished = unchecked((int)0xE0000242);
 
     public async Task<DriverExitCode> InstallAsync(string userSid, CancellationToken cancellationToken = default)
     {
@@ -50,10 +50,12 @@ public sealed class DriverInstaller(IDriverSystem system, Action<string> log, st
         var directory = system.Extract(zip);
         try
         {
+            // Lê o catálogo antes de instalar: se ele não abrir, nada foi instalado ainda.
+            var fromCatalog = system.CatalogThumbprints(Path.Combine(directory, VddPackage.CatalogRelativePath));
             var trustedBefore = system.TrustedPublisherThumbprints();
             log("Instalando o driver (o Windows vai pedir confirmação) ...");
             var error = system.InstallDevice(Path.Combine(directory, VddPackage.InfRelativePath));
-            ForgetPublisherTrustedByTheInstall(trustedBefore, Path.Combine(directory, VddPackage.CatalogRelativePath));
+            ForgetPublisherTrustedByTheInstall(trustedBefore, fromCatalog);
             if (error != 0) return Failed(error);
 
             system.PrepareSettings(VddSettingsFile.DefaultPath, userSid);
@@ -95,9 +97,8 @@ public sealed class DriverInstaller(IDriverSystem system, Action<string> log, st
     /// A confirmação do Windows vem com "Sempre confiar em software de ..." marcado, o que grava o certificado do
     /// editor em TrustedPublisher. O driver instalado não precisa disso: tira o que entrou agora e veio do catálogo.
     /// </summary>
-    private void ForgetPublisherTrustedByTheInstall(IReadOnlySet<string> trustedBefore, string catalogPath)
+    private void ForgetPublisherTrustedByTheInstall(IReadOnlySet<string> trustedBefore, IReadOnlySet<string> fromCatalog)
     {
-        var fromCatalog = system.CatalogThumbprints(catalogPath);
         var added = system.TrustedPublisherThumbprints()
             .Where(thumbprint => !trustedBefore.Contains(thumbprint) && fromCatalog.Contains(thumbprint))
             .ToList();
@@ -110,7 +111,7 @@ public sealed class DriverInstaller(IDriverSystem system, Action<string> log, st
     {
         if (error is ErrorCancelled or ErrorAuthenticodePublisherNotTrusted or ErrorAuthenticodeTrustNotEstablished)
         {
-            log("A instalação do driver foi recusada.");
+            log($"A instalação do driver foi recusada (0x{error:X8}).");
             return DriverExitCode.UserDeclined;
         }
         log($"O Windows não instalou o driver (erro 0x{error:X8}).");

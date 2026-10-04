@@ -76,7 +76,7 @@ public sealed class DriverInstallerTests
     [Theory]
     [InlineData(1223)]                           // ERROR_CANCELLED
     [InlineData(unchecked((int)0xE0000243))]     // ERROR_AUTHENTICODE_PUBLISHER_NOT_TRUSTED
-    [InlineData(unchecked((int)0xE0000244))]     // ERROR_AUTHENTICODE_TRUST_NOT_ESTABLISHED
+    [InlineData(unchecked((int)0xE0000242))]     // ERROR_AUTHENTICODE_TRUST_NOT_ESTABLISHED
     public async Task Declined_confirmation_is_reported_as_user_declined(int error)
     {
         _system.InstallError = error;
@@ -88,6 +88,36 @@ public sealed class DriverInstallerTests
         Assert.Null(_system.PreparedSid);
         Assert.True(_system.TempDeleted);
         Assert.Equal(new[] { "SIGNPATH" }, _system.Removed);
+        Assert.Contains(_log, line => line.Contains($"0x{error:X8}"));
+    }
+
+    [Fact]
+    public async Task Signature_mismatch_is_a_setup_failure_not_a_refusal()
+    {
+        _system.InstallError = unchecked((int)0xE0000244); // ERROR_SIGNATURE_OSATTRIBUTE_MISMATCH
+
+        Assert.Equal(DriverExitCode.SetupFailed, await Installer().InstallAsync("S-1-5-21-1"));
+
+        Assert.Contains(_log, line => line.Contains("0xE0000244"));
+    }
+
+    [Fact]
+    public async Task Catalog_is_read_before_installing()
+    {
+        await Installer().InstallAsync("S-1-5-21-1");
+
+        Assert.True(_system.CatalogReadBeforeInstall);
+    }
+
+    [Fact]
+    public async Task Unreadable_catalog_installs_nothing()
+    {
+        _system.CatalogError = new CryptographicException("catálogo ilegível");
+
+        await Assert.ThrowsAsync<CryptographicException>(() => Installer().InstallAsync("S-1-5-21-1"));
+
+        Assert.Null(_system.InstalledInf);
+        Assert.True(_system.TempDeleted);
     }
 
     [Fact]
@@ -147,6 +177,7 @@ public sealed class DriverInstallerTests
         public bool Installed { get; set; }
         public byte[] DownloadBytes { get; } = [1, 2, 3];
         public Exception? DownloadError { get; set; }
+        public Exception? CatalogError { get; set; }
         public int InstallError { get; set; }
         public int UninstallError { get; set; }
         public int RestartCode { get; set; }
@@ -155,6 +186,7 @@ public sealed class DriverInstallerTests
         public HashSet<string> TrustedByInstall { get; } = new(StringComparer.OrdinalIgnoreCase);
         public List<string> Removed { get; } = [];
         public bool Downloaded { get; private set; }
+        public bool CatalogReadBeforeInstall { get; private set; }
         public string? ExtractedTo { get; private set; }
         public bool TempDeleted { get; private set; }
         public string? InstalledInf { get; private set; }
@@ -181,6 +213,8 @@ public sealed class DriverInstallerTests
         public IReadOnlySet<string> CatalogThumbprints(string catalogPath)
         {
             Assert.Equal(Path.Combine(TempDirectory, @"VirtualDisplayDriver\mttvdd.cat"), catalogPath);
+            if (CatalogError is { } error) throw error;
+            CatalogReadBeforeInstall = InstalledInf is null;
             return Catalog;
         }
 

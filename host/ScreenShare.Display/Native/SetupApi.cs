@@ -30,6 +30,10 @@ internal static class SetupApi
     /// <summary>Cria o dispositivo pela raiz e instala o driver do .inf. Devolve 0 ou o erro do Windows.</summary>
     public static int InstallRootDevice(string hardwareId, string infPath)
     {
+        // Um dispositivo que ficou sem driver seria ligado ao driver junto com o novo, e o Windows ficaria com dois
+        // adaptadores: remove os restos antes de criar.
+        RemoveDevicesWithoutDriver(hardwareId);
+
         var classGuid = DisplayClass;
         var set = SetupDiCreateDeviceInfoList(ref classGuid, IntPtr.Zero);
         if (set == InvalidHandle) return Marshal.GetLastWin32Error();
@@ -71,6 +75,12 @@ internal static class SetupApi
         }
         return error;
     }
+
+    private static void RemoveDevicesWithoutDriver(string hardwareId) =>
+        ForEachDevice(hardwareId, presentOnly: false, (set, data) =>
+        {
+            if (InfName(set, data) is null) SetupDiCallClassInstaller(DifRemove, set, ref data);
+        });
 
     private delegate void DeviceAction(IntPtr set, SP_DEVINFO_DATA data);
 
