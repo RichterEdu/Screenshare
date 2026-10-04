@@ -283,3 +283,25 @@ O controlador executa no PC e no celular do usuário. Os resultados entram neste
 - Bandeja, tela de configurações e controle adaptativo de bitrate (Parte 6).
 - Prioridade de GPU sob carga de jogos, modos acima de 60 Hz, HDR, cor 4:4:4, áudio e vários celulares.
 - Serviço em primeiro plano no Android para manter a conexão com a tela apagada.
+
+## Resultados do spike (2026-10-04, PC: Windows 11 26200, RTX 5060 Ti; celular SM-F976B, Android API 37)
+
+| # | Experimento | Resultado |
+|---|---|---|
+| E1 | Saídas DXGI com o monitor virtual ligado | A saída do VDD (`\.\DISPLAY10`, 2520×1080 em (3440,0)) aparece no **adaptador 0, a própria RTX 5060 Ti** (LUID 0001D004), o mesmo do monitor principal e do encoder: captura e encode na mesma GPU, sem cópia entre adaptadores. Existe um segundo adaptador com o mesmo nome (LUID D18781F5) **sem saídas**: é o adaptador IddCx do VDD. Não é preciso fixar a GPU no `vdd_settings.xml`. |
+| E2 | `DuplicateOutput1` na saída do VDD | ✅ Funciona com DPI por monitor **só na thread** (no processo inteiro também, sem diferença). BGRA, rotação identidade, `DesktopImageInSystemMemory = false`. O quadro chega ~0,6 ms depois do present. |
+| E3 | Win+L, UAC e troca de resolução durante a captura | Win+L/UAC: `ACCESS_LOST`, depois `E_ACCESSDENIED` ao reabrir enquanto a área de trabalho segura está aberta, e a reabertura volta a funcionar sozinha quando ela fecha. Troca de resolução: `ACCESS_LOST` → reabre em 1920×1080 → `ACCESS_LOST` no "Reverter" → reabre em 2520×1080. **Tentar de novo com espera** basta. |
+| E4 | Encoders de hardware | "NVIDIA HEVC Encoder MFT" e "NVIDIA H.264 Encoder MFT" (`VEN_10DE`), **assíncronos** e `D3D11_AWARE`. Entradas: NV12 (e outras). `ICodecAPI.IsSupported`: LowLatency, GOP, RateControl, MeanBitRate, MaxBitRate, BufferSize, Quality, QualityVsSpeed, MaxQP, MinQP e ForceKeyFrame **sim**; `AVEncMPVDefaultBPictureCount` **não** (`E_INVALIDARG` ao definir) — não há B-frames em baixa latência. |
+| E5 | Encode sintético 2520×1080 a 60 fps (texto denso rolando) | Entrada→saída p50 ≈ 3,0 ms, p95 ≈ 6 ms; **1 saída por entrada** (não guarda quadros). Annex-B com start codes de 4 bytes; keyframe = AUD + VPS/SPS/PPS + IDR (H.265 tipo 19; H.264 AUD + SPS + PPS + IDR 5); P = AUD + slice. **O IDR forçado sai no mesmo quadro.** A largura 2520 funciona. ffprobe: `yuv420p`, BT.709, faixa limitada, todos os quadros decodificam. `PeakConstrainedVBR` e `LowDelayVBR` dão o mesmo resultado. |
+| E6 | Captura + encode da área de trabalho real (rolagem de uma página web) a 50 Mbps | Present→saída codificada p50 **3,5 ms**, p95 **7 ms**. P-frames da rolagem: p50 35 KB, máx. 168 KB. **IDRs periódicos de 0,6 a 1 MB** (a cada 120 quadros). Texto nítido nos quadros extraídos. |
+| E7 | Vetores | `annexb/h264-idr.hex` (2 512 bytes) e `annexb/h265-idr.hex` (6 067 bytes), 256×144. |
+| E8 | Celular | Dobrável com duas telas: externa **1080×2520** (a ativa no teste; recorte da câmera de 108 px no topo) e interna **2256×2504**. O HELLO de hoje já mandava 2520×1080, o tamanho real da tela externa. Densidade 480 (override 432). Decoders: `c2.qti.hevc.decoder.low_latency` e `c2.qti.avc.decoder.low_latency` (com `Feature low-latency`), além dos normais. |
+
+### Decisões a partir do spike
+
+- **Captura:** DXGI Desktop Duplication (o plano B, WGC, não é necessário). DPI por monitor só na thread de captura. `ACCESS_LOST` e `E_ACCESSDENIED` → reabrir com espera crescente; tamanho novo na reabertura → encoder novo + `CONFIG` + IDR.
+- **Device:** criado no adaptador da saída achada pelo `DeviceName`; o encoder é escolhido entre os MFTs de hardware do mesmo fornecedor (aqui, um só por codec).
+- **Encoder:** MFT assíncrono, NV12 vindo do `ID3D11VideoProcessor`, `PeakConstrainedVBR`. B-frames não são configurados (não suportado; já são 0). `MaxQP` disponível.
+- **Sem IDR periódico:** com 0,6–1 MB por IDR a cada 2 s, o GOP fixo daria um tranco de dezenas de ms a cada 2 s com a tela em movimento. Como o TCP não perde dados, keyframes só saem no começo do stream, num `KEYFRAME_REQ`, depois de um descarte na fila ou numa reabertura. O GOP é configurado no maior valor aceito (a Task 8 confirma que nenhum IDR aparece sozinho em 600 quadros).
+- **Bitrate padrão:** USB 50 Mbps (pico 100); Wi-Fi 25 Mbps (pico 50). Na rolagem real, a média ficou bem abaixo do teto (~17 Mbps a 60 fps).
+- **Celular:** o HELLO manda o tamanho real da tela em uso (o cálculo atual já dá 1:1 na tela externa; a Task 10 passa a usar `maximumWindowMetrics`, que cobre a interna também). Decoder: preferir o nome terminado em `.low_latency` do codec; senão, o primeiro de hardware com `FEATURE_LowLatency`; senão, o primeiro de hardware.
