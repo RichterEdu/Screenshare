@@ -5,6 +5,7 @@ using System.Security.Cryptography;
 using ScreenShare.Core.Protocol;
 using ScreenShare.Core.Security;
 using ScreenShare.DevHost;
+using ScreenShare.Display;
 
 namespace ScreenShare.Tests.DevHost;
 
@@ -15,6 +16,7 @@ public sealed class HostServerTests : IAsyncLifetime
     private readonly HostIdentity _identity;
     private readonly PairingSession _pairing = new(TimeProvider.System);
     private readonly DeviceRegistry _devices;
+    private readonly FakeMonitorManager _monitors = new();
     private readonly HostServer _server;
     private Task _serving = Task.CompletedTask;
 
@@ -23,7 +25,7 @@ public sealed class HostServerTests : IAsyncLifetime
         _identity = HostIdentity.LoadOrCreate(_dir, "PC de Teste");
         _devices = new DeviceRegistry(Path.Combine(_dir, "paired-devices.json"));
         _server = new HostServer(0, 0, _identity, _pairing, _devices,
-            handshakeTimeout: TimeSpan.FromSeconds(2), idleTimeout: TimeSpan.FromSeconds(2));
+            handshakeTimeout: TimeSpan.FromSeconds(2), idleTimeout: TimeSpan.FromSeconds(2), monitors: _monitors);
     }
 
     public Task InitializeAsync()
@@ -304,6 +306,7 @@ public sealed class HostServerTests : IAsyncLifetime
 
         Assert.Equal(new DeniedMessage(DeniedReason.IncompatibleVersion), await reader.ReadAsync(_cts.Token));
         await AssertClosedAsync(reader);
+        Assert.Equal(0, _monitors.Acquired); // versão errada: nenhum monitor é ligado
     }
 
     [Fact]
@@ -379,5 +382,95 @@ public sealed class HostServerTests : IAsyncLifetime
         await SendAsync(stream, Hello());
 
         Assert.IsType<ConfigMessage>(await reader.ReadAsync(_cts.Token));
+    }
+
+    /// <summary>Espera uma condição que outro fio (o servidor) vai tornar verdadeira.</summary>
+    private async Task WaitUntilAsync(Func<bool> condition)
+    {
+        var deadline = DateTime.UtcNow.AddSeconds(5);
+        while (!condition())
+        {
+            Assert.True(DateTime.UtcNow < deadline, "a condição não ficou verdadeira em 5 s");
+            await Task.Delay(20, _cts.Token);
+        }
+    }
+
+    /// <summary>Wi-Fi + AUTH de um aparelho recém-adicionado + HELLO, até receber o CONFIG.</summary>
+    private async Task<(TcpClient Client, SslStream Stream, MessageReader Reader, ConfigMessage Config)> ConnectWithHelloAsync()
+    {
+        var (_, token) = _devices.Add("Pixel 8");
+        var (client, stream, reader) = await ConnectWifiAsync();
+        await SendAsync(stream, new AuthMessage(token));
+        await SendAsync(stream, Hello());
+        var config = Assert.IsType<ConfigMessage>(await reader.ReadAsync(_cts.Token));
+        return (client, stream, reader, config);
+    }
+
+    [Fact]
+    public async Task Config_carries_the_virtual_monitor_resolution()
+    {
+        _monitors.Monitor = new VirtualMonitor(@"\\.\DISPLAY9", 3440, 0, 1920, 1080, 175);
+
+        var (client, _, _, config) = await ConnectWithHelloAsync();
+        using var _ = client;
+
+        Assert.Equal((1920, 1080), (config.Width, config.Height));
+        Assert.Equal((2400, 1080, 420), Assert.Single(_monitors.Requests));
+    }
+
+    [Fact]
+    public async Task Monitor_is_released_when_the_phone_disconnects()
+    {
+        _monitors.Monitor = new VirtualMonitor(@"\\.\DISPLAY9", 3440, 0, 2400, 1080, 175);
+        var (client, _, _, _) = await ConnectWithHelloAsync();
+
+        client.Dispose();
+
+        await WaitUntilAsync(() => _monitors.Released == 1);
+    }
+
+    [Fact]
+    public async Task Monitor_is_released_when_the_session_dies_by_timeout()
+    {
+        _monitors.Monitor = new VirtualMonitor(@"\\.\DISPLAY9", 3440, 0, 2400, 1080, 175);
+        var (client, _, _, _) = await ConnectWithHelloAsync();
+        using var _ = client;
+
+        // calado além do idleTimeout (2 s): o servidor derruba a sessão
+        await WaitUntilAsync(() => _monitors.Released == 1);
+    }
+
+    [Fact]
+    public async Task Session_that_ends_before_hello_takes_no_monitor()
+    {
+        var (_, token) = _devices.Add("Pixel 8");
+        var (client, stream, _) = await ConnectWifiAsync();
+        await SendAsync(stream, new AuthMessage(token));
+        client.Dispose();
+
+        // A porta atende um cliente por vez: quando o próximo recebe CONFIG, o anterior já acabou.
+        var (next, _, _, _) = await ConnectWithHelloAsync();
+        using var _ = next;
+
+        Assert.Equal(1, _monitors.Acquired);
+    }
+
+    private sealed class FakeMonitorManager : IVirtualMonitorManager
+    {
+        private int _acquired;
+        private int _released;
+
+        public VirtualMonitor? Monitor { get; set; }
+        public List<(int Width, int Height, int Dpi)> Requests { get; } = [];
+        public int Acquired => _acquired;
+        public int Released => _released;
+
+        public VirtualMonitorLease Acquire(int width, int height, int densityDpi)
+        {
+            lock (Requests) Requests.Add((width, height, densityDpi));
+            Interlocked.Increment(ref _acquired);
+            return new VirtualMonitorLease(MonitorRequest.Normalize(width, height, densityDpi), Monitor,
+                () => Interlocked.Increment(ref _released));
+        }
     }
 }

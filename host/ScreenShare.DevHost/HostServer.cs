@@ -4,11 +4,12 @@ using System.Net.Sockets;
 using System.Security.Authentication;
 using ScreenShare.Core.Protocol;
 using ScreenShare.Core.Security;
+using ScreenShare.Display;
 
 namespace ScreenShare.DevHost;
 
 /// <summary>
-/// Servidor de desenvolvimento (sem vídeo). As duas portas exigem TLS e depois PAIR/AUTH antes do HELLO.
+/// Servidor de desenvolvimento (sem vídeo; liga o monitor virtual por sessão). As duas portas exigem TLS e depois PAIR/AUTH antes do HELLO.
 /// A porta USB escuta só em loopback (o `adb reverse` chega por ali). Responde PING com PONG.
 /// Atende um cliente por vez em cada porta; um cliente mudo é derrubado por prazo (handshake e ociosidade).
 /// </summary>
@@ -27,14 +28,17 @@ public sealed class HostServer : IDisposable
     private readonly Action<string>? _log;
     private readonly TimeSpan _handshakeTimeout;
     private readonly TimeSpan _idleTimeout;
+    private readonly IVirtualMonitorManager _monitors;
 
     /// <param name="handshakeTimeout">Prazo para TLS + PAIR/AUTH em qualquer porta (padrão 10 s).</param>
     /// <param name="idleTimeout">
     /// Silêncio máximo numa sessão, em qualquer porta (padrão 10 s). O app manda PING a cada segundo,
     /// então 10 s sem nada é conexão morta (celular sem Wi-Fi, fora de alcance) e não pode prender a porta.
     /// </param>
+    /// <param name="monitors">Monitor virtual por sessão (padrão: nenhum; o CONFIG leva a resolução pedida pelo celular, já normalizada).</param>
     public HostServer(int wifiPort, int usbPort, HostIdentity identity, PairingSession pairing, DeviceRegistry devices,
-        Action<string>? log = null, TimeSpan? handshakeTimeout = null, TimeSpan? idleTimeout = null)
+        Action<string>? log = null, TimeSpan? handshakeTimeout = null, TimeSpan? idleTimeout = null,
+        IVirtualMonitorManager? monitors = null)
     {
         _wifi = new TcpListener(IPAddress.Any, wifiPort);
         _usb = new TcpListener(IPAddress.Loopback, usbPort);
@@ -44,6 +48,7 @@ public sealed class HostServer : IDisposable
         _log = log;
         _handshakeTimeout = handshakeTimeout ?? TimeSpan.FromSeconds(10);
         _idleTimeout = idleTimeout ?? TimeSpan.FromSeconds(10);
+        _monitors = monitors ?? NullVirtualMonitorManager.Instance;
     }
 
     /// <summary>Porta Wi-Fi (TLS) em que está escutando.</summary>
@@ -143,7 +148,11 @@ public sealed class HostServer : IDisposable
             return;
         }
 
-        await SendAsync(stream, new ConfigMessage(hello.Width, hello.Height, VideoCodec.H264, StubBitrateKbps, []), cancellationToken);
+        // O monitor vale enquanto a sessão durar; o using o libera em qualquer saída (fim, erro ou prazo).
+        using var lease = _monitors.Acquire(hello.Width, hello.Height, hello.DensityDpi);
+        if (lease.Monitor is { } monitor)
+            _log?.Invoke($"Monitor virtual: {monitor.DeviceName} {monitor.Width}×{monitor.Height} em ({monitor.X},{monitor.Y}), escala {monitor.ScalePercent}%.");
+        await SendAsync(stream, new ConfigMessage((ushort)lease.Width, (ushort)lease.Height, VideoCodec.H264, StubBitrateKbps, []), cancellationToken);
 
         while (await ReadWithIdleDeadlineAsync(reader, cancellationToken) is { } message)
         {

@@ -38,7 +38,7 @@ Os apps de "segunda tela" existentes pedem configuração chata ou não aceitam 
 
 | Etapa | Tecnologia |
 |---|---|
-| Monitor virtual | [Virtual Display Driver](https://github.com/VirtualDrivers/Virtual-Display-Driver) (open source, já assinado) |
+| Monitor virtual | [Virtual Display Driver](https://github.com/VirtualDrivers/Virtual-Display-Driver) (open source, já assinado), instalado pelo DevHost; liga e desliga pelo próprio Windows, sem administrador |
 | Captura | DXGI Desktop Duplication (`Vortice.Windows`) |
 | Encode | H.265 (fallback H.264) em hardware via Media Foundation |
 | Transporte | TCP com `TCP_NODELAY` e TLS 1.2+ (certificado do PC fixado no pareamento); mDNS no Wi-Fi, `adb reverse` no USB |
@@ -52,9 +52,9 @@ O formato dos bytes trocados entre os dois lados está em [`docs/protocol.md`](d
 - [x] **Parte 1 — Fundação**: protocolo binário completo em C# e em Kotlin (`android/`), testado contra os mesmos vetores
 - [x] **App Android e host de desenvolvimento** — app Compose descobre o PC (mDNS) ou aceita IP, faz o handshake e mostra a latência real (PING/PONG); `ScreenShare.DevHost` é o stub do lado do PC (sem vídeo)
 - [x] **Pareamento e autenticação** — protocolo v2 (11 mensagens, com `PAIR`, `PAIRED`, `AUTH` e `DENIED`): QR + TLS com certificado fixo
-- [x] **Parte 4** — Conexão por cabo USB: porta 38701 via `adb reverse`, com o mesmo TLS e pareamento do Wi-Fi (dá para parear pelo cabo)
-- [ ] **Parte 2** — Monitor virtual (instalação do VDD e `DisplayManager`)
+- [x] **Parte 2** — Monitor virtual: o DevHost instala o [Virtual Display Driver](https://github.com/VirtualDrivers/Virtual-Display-Driver) e liga um monitor na resolução do celular quando ele conecta
 - [ ] **Parte 3** — Vídeo ponta a ponta no Wi-Fi e no cabo + overlay de latência (a descoberta mDNS já existe)
+- [x] **Parte 4** — Conexão por cabo USB: porta 38701 via `adb reverse`, com o mesmo TLS e pareamento do Wi-Fi (dá para parear pelo cabo)
 - [ ] **Parte 5** — Toque multitouch
 - [ ] **Parte 6** — Robustez e UX (reconexão, bandeja, qualidade)
 
@@ -73,6 +73,24 @@ Para testar o app sem o host real, rode o host de desenvolvimento (libere a port
 ```bash
 dotnet run --project host/ScreenShare.DevHost
 ```
+
+**Monitor virtual.** Na primeira execução o DevHost pergunta se pode instalar o driver de monitor virtual (Virtual Display Driver, open source). Respondendo **S**:
+
+1. O Windows pede permissão de administrador (UAC).
+2. Em seguida, pergunta se pode instalar o software de dispositivo. Pode deixar marcado "Sempre confiar": o ScreenShare remove essa confiança logo depois, porque o driver instalado não precisa dela.
+
+A partir daí:
+
+- **Celular conecta:** aparece um monitor novo em Configurações › Tela, na resolução do celular, com escala ajustada pelo tamanho da tela dele.
+- **Primeira vez de um celular:** o Windows pede permissão mais uma vez, para reiniciar o driver e ele aprender a resolução nova. Enquanto isso, o monitor usa a resolução mais próxima que o driver já conhece, e depois passa para a exata. Se o reinício falhar ou for negado, o monitor fica na resolução mais próxima.
+- **Celular desconecta:** o monitor sai da área de trabalho 10 s depois. Ele continua listado em Configurações, como "desconectado", enquanto o driver estiver instalado.
+- **Escala e posição:** o que você mudar em Configurações › Tela continua valendo nas próximas conexões.
+
+Para rodar sem monitor virtual: `dotnet run --project host/ScreenShare.DevHost -- --sem-monitor`. Para remover o driver:
+
+~~~powershell
+dotnet run --project host/ScreenShare.DevHost -- uninstall-driver
+~~~
 
 Comandos do console do DevHost:
 

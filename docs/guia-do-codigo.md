@@ -36,14 +36,18 @@ No caminho de volta, o `MessageReader` lê o fluxo de bytes, junta os pedaços d
 | `host/ScreenShare.Core/Security/PairingSession.cs` | O segredo de uso único do QR: gera, vale 2 minutos e é consumido na primeira vez que alguém o apresenta. |
 | `host/ScreenShare.Core/Security/PairingUri.cs` | Monta o texto `screenshare://pair?...` que vira o QR. |
 | `host/ScreenShare.Core/Security/DeviceRegistry.cs` | A lista de celulares pareados (arquivo JSON): guarda só o **hash** da chave de cada um. |
-| `host/ScreenShare.DevHost/Program.cs` | O programa de console do host de desenvolvimento: comandos `p`, `l`, `r <id>` e anúncio mDNS. |
+| `host/ScreenShare.DevHost/Program.cs` | O programa de console do host de desenvolvimento: comandos `p`, `l`, `r <id>` e anúncio mDNS; modos de driver e `--sem-monitor`. |
 | `host/ScreenShare.DevHost/HostServer.cs` | O servidor TCP: porta 38700 (Wi-Fi) e porta 38701 (USB, só loopback), as duas com TLS + pareamento. |
 | `host/ScreenShare.DevHost/LanAddressSelector.cs` | Escolhe quais IPs do PC anunciar e qual vai no QR. |
-| `host/ScreenShare.Tests/ScreenShare.Tests.csproj` | Projeto de testes automáticos (xUnit). Referencia o `Core` e copia os vetores `.hex` para a pasta de saída. |
+| `host/ScreenShare.DevHost/MonitorSetup.cs` | Ao iniciar, oferece instalar o driver de monitor virtual e cria o `VirtualMonitorManager`. |
+| `host/ScreenShare.DevHost/DriverCommands.cs` | Os modos `install-driver`, `uninstall-driver` e `restart-driver`, reabertos como administrador. |
+| `host/ScreenShare.Display/` | Biblioteca do monitor virtual: instala o driver, liga/desliga o monitor e guarda escala e posição (ver a seção "ScreenShare.Display"). |
+| `host/ScreenShare.Tests/ScreenShare.Tests.csproj` | Projeto de testes automáticos (xUnit). Referencia o `Core`, o `Display` e o `DevHost` e copia os vetores `.hex` para a pasta de saída. |
 | `host/ScreenShare.Tests/Protocol/Vectors.cs` | Lê um arquivo `.hex` de `docs/protocol-vectors` e o transforma em `byte[]`. |
 | `host/ScreenShare.Tests/Protocol/MessageCodecTests.cs` | 32 casos de teste do `MessageCodec`: confere os vetores nos dois sentidos e rejeita mensagens inválidas (inclui PAIR, PAIRED, AUTH e DENIED). |
 | `host/ScreenShare.Tests/Protocol/MessageReaderTests.cs` | 5 testes do `MessageReader`: mensagens em sequência, entrega de 1 byte por vez, conexão cortada no meio e tamanho gigante. |
-| `host/ScreenShare.Tests/Security/` e `host/ScreenShare.Tests/DevHost/` | Testes de `Security/` (25 casos) e do host de desenvolvimento (33 casos). |
+| `host/ScreenShare.Tests/Security/` e `host/ScreenShare.Tests/DevHost/` | Testes de `Security/` (25 casos) e do host de desenvolvimento (63 casos). |
+| `host/ScreenShare.Tests/Display/` | Testes da biblioteca do monitor virtual (99 casos, 1 deles de integração com o driver real, ignorado por padrão). |
 | `docs/protocol.md` | Especificação do protocolo, a "fonte da verdade". |
 | `docs/protocol-vectors/*.hex` | Bytes de referência, usados pelo C# e pelo Kotlin para provarem que falam igual. |
 
@@ -559,7 +563,7 @@ O teste `Touch_matches_vector` confere os dois sentidos: o `Encode` gera esses 3
 
 ## 7. Os testes
 
-**xUnit** é o framework de testes. O `.csproj` de testes referencia o projeto `Core` e os pacotes do xUnit. São **95 casos de teste** ao todo: `MessageCodecTests` (32), `MessageReaderTests` (5), os de `Security/` (25: `DeviceRegistryTests` 12, `PairingSessionTests` 7, `HostIdentityTests` 4, `PairingUriTests` 2) e os do host de desenvolvimento (33: `HostServerTests` 15, `LanAddressSelectorTests` 18). As seções abaixo detalham os dois primeiros arquivos, que são os do protocolo básico.
+**xUnit** é o framework de testes. O `.csproj` de testes referencia os projetos `Core`, `Display` e `DevHost` e os pacotes do xUnit. São **224 casos de teste** ao todo (223 rodam; 1 de integração fica ignorado sem `SCREENSHARE_VDD_TESTS=1`): `MessageCodecTests` (32), `MessageReaderTests` (5), os de `Security/` (25: `DeviceRegistryTests` 12, `PairingSessionTests` 7, `HostIdentityTests` 4, `PairingUriTests` 2), os do host de desenvolvimento (63: `HostServerTests` 23, `LanAddressSelectorTests` 18, `DriverCommandsTests` 14, `MonitorSetupTests` 8) e os de `Display/` (99: `VirtualMonitorManagerTests` 31, `DriverInstallerTests` 17, `VddSettingsFileTests` 13, `DisplayTopologyTests` 12, `ScaleCalculatorTests` 11, `DisplayStateStoreTests` 10, `ElevatedCommandTests` 4, `DisplayTopologyIntegrationTests` 1, ignorado por padrão). As seções abaixo detalham os dois primeiros arquivos, que são os do protocolo básico.
 
 - `[Fact]` = um teste simples.
 - `[Theory]` + `[InlineData(...)]` = o mesmo teste rodado várias vezes com valores diferentes (cada `[InlineData]` conta como um caso). Em `Hello_with_invalid_codec_flags_is_rejected`, roda com `0` (nenhum codec) e `4` (bit desconhecido); em `Touch_with_invalid_pointer_count_is_rejected`, com `0` e `11` dedos.
@@ -584,6 +588,27 @@ O teste `Touch_matches_vector` confere os dois sentidos: o `Encode` gera esses 3
 
 **Vetores compartilhados.** A pasta `docs/protocol-vectors` tem os bytes exatos de cada mensagem. O `.csproj` de testes copia esses `.hex` para a pasta de saída (a linha `<None Include="..\..\docs\protocol-vectors\*.hex" ...>`), e `Vectors.Load("ping.hex")` os lê: ignora tudo depois de `#` (comentário), separa os pares hexadecimais e converte cada um em `byte` com `Convert.ToByte(token, 16)`. O app Android (Kotlin) testa contra os **mesmos arquivos**, então os dois lados provam que falam o mesmo "idioma" sem precisarem rodar juntos.
 
+## ScreenShare.Display (monitor virtual)
+
+**Para que serve.** Faz o Windows ganhar um monitor de verdade quando o celular conecta. O driver que cria o monitor é o Virtual Display Driver (VDD), de terceiros; este projeto apenas o instala e o controla.
+
+**`VddSettingsFile`.** É o XML de configuração do driver, com a lista de resoluções que ele oferece. O driver só lê esse XML quando reinicia, por isso resolução nova exige reiniciá-lo.
+
+**`DisplayTopology` / `IDisplayTopology`.** Liga o monitor (anexa a saída do driver à área de trabalho) e desliga (desanexa), usando as funções do próprio Windows, sem precisar de administrador. Também troca a resolução e a escala. A saída do driver é achada pelo ID do dispositivo `Root\MttVDD`, e não pelo nome `\.\DISPLAYn`, porque esse nome muda a cada vez que o Windows renumera os monitores; o ID do driver é fixo.
+
+**`VirtualMonitorManager`.** É quem decide quando ligar e desligar:
+
+- **Contagem de referências:** cada celular conectado soma 1; o monitor só desliga quando a conta chega a zero.
+- **Espera de 10 s:** ao desconectar, ele espera 10 s antes de desligar, para que uma reconexão rápida reaproveite o monitor.
+- **Resolução nova:** grava no XML e pede o reinício do driver (com UAC), em segundo plano. Enquanto isso usa a resolução mais próxima; se o reinício falhar, o monitor fica nela (ligado se há celular, desligado se não há).
+- **Nunca derruba a sessão:** qualquer falha aqui é registrada e engolida; o vídeo e o resto do host continuam funcionando sem o monitor.
+
+**`DisplayStateStore`.** Guarda o `display.json`: a escala aplicada uma única vez (depois disso vale o que o usuário ajustar) e a última posição do monitor. Gravar é "melhor esforço": se falhar, nada quebra.
+
+**`DriverInstaller` / `WindowsDriverSystem` / `ElevatedCommand`.** O DevHost tem três modos que rodam como administrador, e só eles: `install-driver`, `uninstall-driver` e `restart-driver`. O `ElevatedCommand` relança o próprio programa com o UAC (e não relança o `dotnet.exe`; use `dotnet run --project host/ScreenShare.DevHost`). O instalador confere o **SHA-256 fixado** do pacote do driver antes de instalar, prepara o XML antes de instalar o dispositivo e, no fim, remove de `TrustedPublisher` o certificado do fabricante que ele mesmo adicionou.
+
+**Por que não o pipe do driver.** O VDD tem um canal próprio (um pipe) para receber comandos, mas o spike mostrou que esses comandos derrubam o driver. Por isso o projeto usa o XML + reinício. Detalhes na seção "Resultados do spike" de `docs/superpowers/specs/2026-10-04-parte-2-monitor-virtual-design.md`.
+
 ## 8. Como rodar e o que falta
 
 Na raiz do repositório:
@@ -592,10 +617,10 @@ Na raiz do repositório:
 dotnet test host
 ```
 
-(Se você já estiver dentro da pasta `host`, basta `dotnet test`.) O resultado esperado é **95 testes aprovados e nenhum com falha**. A última linha da saída fica assim; o tempo muda a cada execução e, num .NET em inglês, ela começa com `Passed!` e usa `Failed`, `Passed` e `Skipped`:
+(Se você já estiver dentro da pasta `host`, basta `dotnet test`.) O resultado esperado é **223 testes aprovados e nenhum com falha** (mais 1 teste de integração com o driver real, que só roda com `SCREENSHARE_VDD_TESTS=1` e fica ignorado por padrão). A última linha da saída fica assim; o tempo muda a cada execução e, num .NET em inglês, ela começa com `Passed!` e usa `Failed`, `Passed` e `Skipped`:
 
 ```
-Aprovado!  – Com falha:     0, Aprovado:    95, Ignorado:     0, Total:    95, Duração: 4 s - ScreenShare.Tests.dll (net10.0)
+Aprovado!  – Com falha:     0, Aprovado:   223, Ignorado:     1, Total:   224, Duração: 4 s - ScreenShare.Tests.dll (net10.0)
 ```
 
 **O que falta.** No lado C#, a Parte 1 está completa (as mensagens do protocolo, o `MessageCodec` e o `MessageReader`) e o pareamento por QR com TLS já funciona no host de desenvolvimento. O que ainda não existe é o resto do sistema (captura, vídeo, toque), que vem nas próximas partes do roteiro. A tabela "Roteiro das partes", no plano da Parte 1 (em `docs/superpowers/plans/`), resume o que cada uma entrega, e cada parte ganha o seu plano quando chegar a vez dela:
