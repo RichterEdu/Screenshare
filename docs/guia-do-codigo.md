@@ -293,7 +293,7 @@ Um tipo de erro próprio. Herda de `IOException`, então código de rede que já
 2. `Begin(tipo, tamanhoDoPayload, out bytes)` cria o array já com tamanho total (5 + payload), grava o `type` no byte 0 e o `length` nos bytes 1-4, e devolve um `PayloadWriter` posicionado logo depois do cabeçalho. Se o payload passar de `MaxPayloadLength` (16 MiB), o `Begin` lança `ProtocolException` antes de criar o array.
 3. O `case` escreve os campos na ordem do protocolo (para HELLO: versão, largura, altura, dpi, codecs = 2+2+2+2+1 = **9** bytes).
 4. Devolve `bytes`.
-5. Qualquer outra subclasse de `Message` → `ArgumentException`. Com as 7 mensagens do protocolo cobertas, isso só aconteceria com uma mensagem nova, que o `Encode` não conhece.
+5. Qualquer outra subclasse de `Message` → `ArgumentException`. Com as 11 mensagens do protocolo cobertas, isso só aconteceria com uma mensagem nova, que o `Encode` não conhece.
 
 O tamanho de payload que cada `case` passa ao `Begin` (`n` = quantidade de bytes de dados; no TOUCH, quantidade de dedos):
 
@@ -305,6 +305,10 @@ O tamanho de payload que cada `case` passa ao `Begin` (`n` = quantidade de bytes
 | TOUCH | `1 + 14·n` | 1 (quantidade) + 14 (`TouchPointerSize`) por dedo |
 | PING / PONG | 8 | 8 (timestamp) |
 | KEYFRAME_REQ | 0 | nada |
+| PAIR | `33 + n` | 32 (segredo) + 1 (tamanho do nome) = 33, mais os `n` bytes do nome do celular em UTF-8 |
+| PAIRED | 32 | a chave de acesso (`TokenLength`) |
+| AUTH | 32 | a chave de acesso (`TokenLength`) |
+| DENIED | 1 | o motivo (`DeniedReason`) |
 
 **`Decode(byte type, ReadOnlySpan<byte> payload)`** — bytes → objeto:
 1. Cria um `PayloadReader` sobre o payload.

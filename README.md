@@ -73,7 +73,7 @@ Para testar o app sem o host real, rode o host de desenvolvimento (libere a port
 dotnet run --project host/ScreenShare.DevHost
 ```
 
-No console, digite `p` para mostrar o QR de pareamento e escaneie com o app (botão **Parear com PC**). `l` lista os celulares pareados e `r <id>` remove um. Pelo cabo USB, rode `adb reverse tcp:38701 tcp:38701` e use **Conectar por cabo USB** no app.
+No console, digite `p` para mostrar o QR de pareamento e escaneie com o app (botão **Parear com PC (QR)**). `l` lista os celulares pareados e `r <id>` remove um. Pelo cabo USB, rode `adb reverse tcp:38701 tcp:38701` e use **Conectar por cabo USB** no app.
 
 App Android (usa o JDK do Android Studio):
 
