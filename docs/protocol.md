@@ -21,15 +21,17 @@ As mensagens são as mesmas nas duas portas; muda só o que vem antes do `HELLO`
 
 ## Sequência
 
-**Wi-Fi (38700), primeiro uso — pareamento pelo QR:** TLS → `PAIR` → `PAIRED` → `AUTH` → `HELLO` → `CONFIG`.
-**Wi-Fi (38700), já pareado:** TLS → `AUTH` → `HELLO` → `CONFIG`.
-**USB (38701):** `HELLO` → `CONFIG`.
+- **Wi-Fi (38700), primeiro uso — pareamento pelo QR:** TLS → `PAIR` → `PAIRED` → `AUTH` → `HELLO` → `CONFIG`.
+- **Wi-Fi (38700), já pareado:** TLS → `AUTH` → `HELLO` → `CONFIG`.
+- **USB (38701):** `HELLO` → `CONFIG`.
+
+Depois do `AUTH` (e no USB), 10 s sem nenhuma mensagem do celular fecham a conexão (o app envia `PING` a cada segundo).
 
 Depois do `CONFIG`: o PC envia `FRAME`s (o primeiro é keyframe) e, a qualquer momento, vêm `TOUCH`, `PING`/`PONG`, `KEYFRAME_REQ`.
 
 Regras:
-- Na 38700 a primeira mensagem tem de ser `PAIR` ou `AUTH`; depois de `PAIR`/`PAIRED` vem `AUTH`. Qualquer outra coisa → `DENIED` e fechamento.
-- Na 38701 a primeira mensagem tem de ser `HELLO`.
+- Na 38700 a primeira mensagem tem de ser `PAIR` ou `AUTH`; depois de `PAIR`/`PAIRED` vem `AUTH`. Qualquer outra coisa → `DENIED(2)` e fechamento.
+- Na 38701 a primeira mensagem tem de ser `HELLO`; qualquer outra coisa fecha a conexão sem `DENIED`.
 - `HELLO` com `protocolVersion` ≠ 2 → `DENIED(3)` e fechamento.
 - Depois de `DENIED` o PC fecha a conexão.
 
@@ -93,7 +95,7 @@ Sem payload. O celular pede um keyframe depois de um erro de decodificação.
 | Campo | Tipo | Observação |
 |---|---|---|
 | secret | 32 bytes | segredo de pareamento lido do QR (válido por 2 minutos, uso único) |
-| deviceNameLength | u8 | 1 a 64 |
+| deviceNameLength | u8 | 1 a 64 bytes UTF-8 (UTF-8 inválido é erro) |
 | deviceName | UTF-8 | nome do celular, mostrado no PC |
 
 ### PAIRED
@@ -120,7 +122,7 @@ O host anuncia por mDNS/DNS-SD o serviço **`_screenshare._tcp`**, com a porta T
 - Stream terminando no meio de uma mensagem: `EndOfStreamException` (C#) / `EOFException` (Kotlin). Terminando entre mensagens: desconexão normal (`null`).
 
 ## Vetores de teste
-`docs/protocol-vectors/*.hex` são quadros completos (cabeçalho + payload) em pares hexadecimais; `#` inicia comentário. As duas implementações devem gerar e aceitar exatamente esses bytes.
+`docs/protocol-vectors/*.hex` são quadros completos (cabeçalho + payload) em pares hexadecimais; `#` inicia comentário. As duas implementações devem gerar e aceitar exatamente esses bytes. `pairing-uri.txt` guarda a URI de exemplo do QR, compartilhada pelos testes C# e Kotlin.
 
 | Arquivo | Conteúdo |
 |---|---|

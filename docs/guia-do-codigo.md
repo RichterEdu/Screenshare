@@ -1,6 +1,6 @@
 # Guia do código — ScreenShare (host Windows, C#)
 
-Este guia explica o código que já existe em `host/`, pensado para quem nunca viu C#. Estado descrito: commit `6506c17` (protocolo v1 completo: as 7 mensagens HELLO, CONFIG, FRAME, TOUCH, PING, PONG e KEYFRAME_REQ, mais o `MessageReader`). Quando o código avançar, este guia precisa ser atualizado.
+Este guia explica o código que já existe em `host/`, pensado para quem nunca viu C#. Estado descrito: protocolo **v2** (as 7 mensagens originais HELLO, CONFIG, FRAME, TOUCH, PING, PONG e KEYFRAME_REQ, mais PAIR, PAIRED, AUTH e DENIED), o `MessageReader`, a pasta `Security/` e o host de desenvolvimento com pareamento por QR. A v1 era só as 7 primeiras; a **v2 acrescentou o pareamento**, e por isso o número da versão no HELLO passou de 1 para 2. Quando o código avançar, este guia precisa ser atualizado.
 
 ## 1. Visão geral em 1 minuto
 
@@ -11,7 +11,7 @@ O projeto transforma o celular Android numa segunda tela do PC:
 
 Os dois conversam por **uma conexão TCP**, que é só um "cano" por onde passam bytes. Os bytes precisam ter um formato combinado, senão um lado não entende o outro. Esse formato é o **protocolo** (descrito em `docs/protocol.md`).
 
-O código atual faz duas coisas: **traduzir entre objetos C# (`HelloMessage`, `PingMessage`...) e bytes** (o `MessageCodec`) e **ler mensagens inteiras de um fluxo de bytes** (o `MessageReader`). Ainda não abre rede, não captura tela, não tem vídeo. Isso vem nas próximas partes do plano.
+O código atual faz duas coisas: **traduzir entre objetos C# (`HelloMessage`, `PingMessage`...) e bytes** (o `MessageCodec`) e **ler mensagens inteiras de um fluxo de bytes** (o `MessageReader`). A rede e o pareamento ficam em volta dele (seção 5.8, `Security/` e o `DevHost`); ainda não há captura de tela nem vídeo. Isso vem nas próximas partes do plano.
 
 ```
 objeto C#  ──Encode──▶  bytes  ──(rede, futuro)──▶  bytes  ──Decode──▶  objeto C#
@@ -32,10 +32,18 @@ No caminho de volta, o `MessageReader` lê o fluxo de bytes, junta os pedaços d
 | `host/ScreenShare.Core/Protocol/PayloadWriter.cs` | Ferramenta que **escreve** números em sequência dentro de um array de bytes. |
 | `host/ScreenShare.Core/Protocol/PayloadReader.cs` | Ferramenta que **lê** números em sequência de um array de bytes. |
 | `host/ScreenShare.Core/Protocol/ProtocolException.cs` | O tipo de erro lançado quando os bytes violam o protocolo. |
+| `host/ScreenShare.Core/Security/HostIdentity.cs` | O certificado do PC: cria (uma vez) e carrega o certificado autoassinado, e calcula a **digital** dele. |
+| `host/ScreenShare.Core/Security/PairingSession.cs` | O segredo de uso único do QR: gera, vale 2 minutos e é consumido na primeira vez que alguém o apresenta. |
+| `host/ScreenShare.Core/Security/PairingUri.cs` | Monta o texto `screenshare://pair?...` que vira o QR. |
+| `host/ScreenShare.Core/Security/DeviceRegistry.cs` | A lista de celulares pareados (arquivo JSON): guarda só o **hash** da chave de cada um. |
+| `host/ScreenShare.DevHost/Program.cs` | O programa de console do host de desenvolvimento: comandos `p`, `l`, `r <id>` e anúncio mDNS. |
+| `host/ScreenShare.DevHost/HostServer.cs` | O servidor TCP: porta 38700 (TLS + pareamento) e porta 38701 (USB, só loopback). |
+| `host/ScreenShare.DevHost/LanAddressSelector.cs` | Escolhe quais IPs do PC anunciar e qual vai no QR. |
 | `host/ScreenShare.Tests/ScreenShare.Tests.csproj` | Projeto de testes automáticos (xUnit). Referencia o `Core` e copia os vetores `.hex` para a pasta de saída. |
 | `host/ScreenShare.Tests/Protocol/Vectors.cs` | Lê um arquivo `.hex` de `docs/protocol-vectors` e o transforma em `byte[]`. |
-| `host/ScreenShare.Tests/Protocol/MessageCodecTests.cs` | 21 casos de teste do `MessageCodec`: confere os vetores nos dois sentidos e rejeita mensagens inválidas. |
+| `host/ScreenShare.Tests/Protocol/MessageCodecTests.cs` | 32 casos de teste do `MessageCodec`: confere os vetores nos dois sentidos e rejeita mensagens inválidas (inclui PAIR, PAIRED, AUTH e DENIED). |
 | `host/ScreenShare.Tests/Protocol/MessageReaderTests.cs` | 5 testes do `MessageReader`: mensagens em sequência, entrega de 1 byte por vez, conexão cortada no meio e tamanho gigante. |
+| `host/ScreenShare.Tests/Security/` e `host/ScreenShare.Tests/DevHost/` | Testes de `Security/` (25 casos) e do host de desenvolvimento (33 casos). |
 | `docs/protocol.md` | Especificação do protocolo, a "fonte da verdade". |
 | `docs/protocol-vectors/*.hex` | Bytes de referência, usados pelo C# e pelo Kotlin para provarem que falam igual. |
 
@@ -234,7 +242,7 @@ O `length` existe porque o TCP é um fluxo contínuo de bytes, sem divisão entr
 
 Declara os vocabulários do protocolo:
 
-- `MessageType`: o número que vai no byte `type` (Hello=1, Config=2, Frame=3, Touch=4, Ping=5, Pong=6, KeyframeRequest=7).
+- `MessageType`: o número que vai no byte `type` (Hello=1, Config=2, Frame=3, Touch=4, Ping=5, Pong=6, KeyframeRequest=7, e da v2 Pair=8, Paired=9, Auth=10, Denied=11).
 - `VideoCodec`: H264=1, H265=2 (flags combináveis: o HELLO carrega uma combinação; o CONFIG, exatamente um).
 - `TouchAction`: Down=0, Move=1, Up=2, Cancel=3 (dedo encostou, moveu, soltou, gesto cancelado).
 - As mensagens, todas `record`s que herdam de `Message`:
@@ -247,6 +255,10 @@ Declara os vocabulários do protocolo:
 | `TouchMessage` | celular → PC | lista de dedos (`TouchPointer`), cada um com id, ação, posição 0..1 e pressão |
 | `PingMessage` / `PongMessage` | qualquer lado / resposta | um timestamp (para medir latência) |
 | `KeyframeRequestMessage` | celular → PC | nada (só "me mande um quadro completo") |
+| `PairMessage` | celular → PC (Wi-Fi) | o segredo de 32 bytes lido do QR e o nome do celular |
+| `PairedMessage` | PC → celular | a chave de acesso de 32 bytes, entregue uma única vez |
+| `AuthMessage` | celular → PC (Wi-Fi) | a chave de acesso, antes do HELLO |
+| `DeniedMessage` | PC → celular | o motivo da recusa (`DeniedReason`: segredo inválido, aparelho desconhecido, versão incompatível) |
 
 **Keyframe** = quadro de vídeo completo, que pode ser decodificado sozinho. Os outros quadros guardam só as diferenças; se algo se perde, o celular pede um keyframe para "recomeçar".
 
@@ -274,7 +286,7 @@ Um tipo de erro próprio. Herda de `IOException`, então código de rede que já
 
 ### 5.5 `MessageCodec.cs`
 
-**Constantes:** `ProtocolVersion = 1`, `HeaderSize = 5`, `MaxPayloadLength = 16 MiB`, `MaxTouchPointers = 10`. Duas constantes são privadas: `TouchPointerSize = 14` (os bytes de cada dedo no TOUCH: id 1 + ação 1 + x 4 + y 4 + pressão 4) e `KnownCodecs`, a máscara `H264 | H265` usada para validar.
+**Constantes:** `ProtocolVersion = 2` (a v2 acrescentou o pareamento; o HELLO com outra versão é recusado), `SecretLength` e `TokenLength` (32 bytes cada), `HeaderSize = 5`, `MaxPayloadLength = 16 MiB`, `MaxTouchPointers = 10`. Duas constantes são privadas: `TouchPointerSize = 14` (os bytes de cada dedo no TOUCH: id 1 + ação 1 + x 4 + y 4 + pressão 4) e `KnownCodecs`, a máscara `H264 | H265` usada para validar.
 
 **`Encode(Message)`** — objeto → bytes:
 1. O `switch` descobre qual mensagem é.
@@ -369,6 +381,77 @@ Reader:  Stream ─▶ 5 bytes de cabeçalho ─▶ confere length ─▶ payloa
 
 No `Reader`, o fluxo acabar antes do primeiro byte de uma mensagem dá `null`; acabar no meio dela dá `EndOfStreamException`.
 
+### 5.8 Pareamento e autenticação
+
+Na porta Wi-Fi qualquer aparelho da rede consegue abrir uma conexão, então o PC precisa de duas garantias: o celular fala **com o PC certo** (e não com um impostor) e o PC só atende **celulares que o dono autorizou**. Cada peça de `Security/` cuida de uma parte.
+
+**A digital do certificado (`HostIdentity`).** Na primeira execução o PC cria um certificado TLS autoassinado e o reaproveita depois. A **digital** (*fingerprint*) é o SHA-256 dos bytes do certificado: um resumo curto, que muda por completo se o certificado mudar. O QR leva essa digital; o celular a guarda e, nas conexões seguintes, **recusa qualquer certificado cuja digital seja diferente**. Assim ninguém consegue se passar pelo PC, mesmo sem uma autoridade certificadora:
+
+```csharp
+/// <summary>SHA-256 do certificado em DER, em base64url sem padding (vai no QR).</summary>
+public string Fingerprint { get; }
+...
+public static string ComputeFingerprint(ReadOnlySpan<byte> der) => Base64Url.EncodeToString(SHA256.HashData(der));
+```
+
+**Por que o QR leva um segredo de uso único (`PairingSession`).** Quem enxerga o QR (uma foto, por cima do ombro) poderia se parear. Por isso o QR carrega um segredo aleatório de 32 bytes que vale só **2 minutos** e é **consumido** na primeira vez que alguém o apresenta; gerar um QR novo invalida o anterior. Depois de usado, a foto do QR não serve mais para nada:
+
+```csharp
+public static readonly TimeSpan Lifetime = TimeSpan.FromMinutes(2);
+...
+public bool TryConsume(ReadOnlySpan<byte> secret)
+{
+    lock (_lock)
+    {
+        if (_secret is null) return false;
+        if (clock.GetUtcNow() >= _expiresAt)
+        {
+            _secret = null;
+            return false;
+        }
+        if (!CryptographicOperations.FixedTimeEquals(_secret, secret)) return false;
+        _secret = null;
+        return true;
+    }
+}
+```
+
+(`FixedTimeEquals` compara em tempo constante, para que o tempo da resposta não revele quantos bytes estavam certos. `lock` impede que duas conexões usem o mesmo segredo ao mesmo tempo.) O que vai no QR é a URI montada por `PairingUri.Build`: endereço e porta do PC (`h`, `p`), a digital (`fp`), o segredo (`s`) e o nome do PC (`n`).
+
+**Por que o PC guarda só o hash da chave (`DeviceRegistry`).** No pareamento o PC gera uma **chave de acesso** de 32 bytes e a entrega ao celular uma única vez (`PAIRED`). Nas conexões seguintes o celular a apresenta no `AUTH`. O PC não guarda a chave, só o SHA-256 dela: se alguém copiar o arquivo `paired-devices.json`, vê apenas hashes, que não permitem se passar por um celular (um hash não volta a ser a chave). Para conferir um `AUTH`, o PC calcula o hash da chave recebida e procura o mesmo hash na lista:
+
+```csharp
+var token = RandomNumberGenerator.GetBytes(MessageCodec.TokenLength);
+var device = new PairedDevice(
+    Convert.ToHexStringLower(RandomNumberGenerator.GetBytes(4)), name,
+    Convert.ToHexStringLower(SHA256.HashData(token)), _clock.GetUtcNow());
+```
+
+Remover um celular (`Remove`, comando `r <id>` do console) apaga a linha dele: a chave dele deixa de funcionar na hora.
+
+**Como as peças se encaixam (`HostServer`).** Na porta Wi-Fi o servidor abre o TLS e olha a primeira mensagem: `PAIR` (primeiro uso) ou `AUTH` (já pareado). Só depois de autenticado é que o fluxo normal, `HELLO` → `CONFIG`, começa:
+
+```csharp
+if (first is PairMessage pair)
+{
+    if (!_pairing.TryConsume(pair.Secret))
+    {
+        await DenyAsync(tls, DeniedReason.InvalidPairingSecret, cancellationToken);
+        return;
+    }
+    var (device, token) = _devices.Add(pair.DeviceName);
+    ...
+    await SendAsync(tls, new PairedMessage(token), cancellationToken);
+    first = await reader.ReadAsync(handshake.Token);
+}
+```
+
+Qualquer coisa fora do esperado recebe um `DENIED` com o motivo. Prazos evitam que um cliente mudo prenda a porta: 10 s para o TLS e o pareamento, e 10 s sem mensagem alguma depois disso (o app manda `PING` a cada segundo).
+
+**Por que o USB não precisa disso.** A porta 38701 só escuta em `127.0.0.1` (`new TcpListener(IPAddress.Loopback, usbPort)`), ou seja, só aceita conexões vindas do próprio PC. O `adb reverse` faz o cabo USB chegar ali como se fosse local, e o tráfego não passa pela rede: não há quem espionar nem quem se passar por outro. Por isso essa porta vai direto ao `HELLO`, sem TLS e sem pareamento.
+
+**O console (`Program.cs`) e o `LanAddressSelector`.** Digitar `p` chama `pairing.Begin()` para gerar o segredo, monta a URI com `PairingUri.Build` e a desenha como QR no console. O IP que vai no QR vem do `LanAddressSelector.PickForPairing`, que prefere um IP de rede privada (10.x, 172.16-31.x, 192.168.x): o PC pode ter adaptadores de VPN ou de máquina virtual cujos IPs o celular não alcança.
+
 ## 6. Exemplos trabalhados
 
 ### 6.1 `PingMessage(123456789)`
@@ -454,14 +537,14 @@ O teste `Touch_matches_vector` confere os dois sentidos: o `Encode` gera esses 3
 
 ## 7. Os testes
 
-**xUnit** é o framework de testes. O `.csproj` de testes referencia o projeto `Core` e os pacotes do xUnit. São **26 casos de teste** em dois arquivos: `MessageCodecTests` (21) e `MessageReaderTests` (5).
+**xUnit** é o framework de testes. O `.csproj` de testes referencia o projeto `Core` e os pacotes do xUnit. São **95 casos de teste** ao todo: `MessageCodecTests` (32), `MessageReaderTests` (5), os de `Security/` (25: `DeviceRegistryTests` 12, `PairingSessionTests` 7, `HostIdentityTests` 4, `PairingUriTests` 2) e os do host de desenvolvimento (33: `HostServerTests` 15, `LanAddressSelectorTests` 18). As seções abaixo detalham os dois primeiros arquivos, que são os do protocolo básico.
 
 - `[Fact]` = um teste simples.
 - `[Theory]` + `[InlineData(...)]` = o mesmo teste rodado várias vezes com valores diferentes (cada `[InlineData]` conta como um caso). Em `Hello_with_invalid_codec_flags_is_rejected`, roda com `0` (nenhum codec) e `4` (bit desconhecido); em `Touch_with_invalid_pointer_count_is_rejected`, com `0` e `11` dedos.
 - `Assert.Equal(esperado, atual)` falha o teste se forem diferentes; `Assert.Throws<ProtocolException>(...)` falha se o código **não** lançar aquele erro.
 - Mais três do xUnit que aparecem nos testes novos: `Assert.IsType<ConfigMessage>(x)` confere o tipo e devolve `x` já como esse tipo; `Assert.Null(x)` confere que `x` é `null`; `await Assert.ThrowsAsync<...>(...)` é o `Throws` para código `async`.
 
-**`MessageCodecTests` (21 casos).**
+**`MessageCodecTests`: os 21 casos do protocolo básico** (os outros 11 cobrem PAIR, PAIRED, AUTH e DENIED, com vetores `pair.hex`, `paired.hex`, `auth.hex` e `denied.hex`).
 - **7 de vetor**, um por mensagem (`Hello_matches_vector`, `Ping_...`, `Pong_...`, `KeyframeRequest_...`, `Config_...`, `Frame_...`, `Touch_...`): o `Encode` precisa gerar exatamente os bytes do `.hex`, e o `Decode` desses bytes precisa devolver a mensagem original. Os de CONFIG e FRAME usam a expressão `with` (ver glossário), por causa do `byte[]`.
 - **14 de erro**, todos esperando uma `ProtocolException`:
   - os já existentes: tipo desconhecido (`0x63`), payload truncado (8 bytes num HELLO que pede 9), bytes sobrando (9 bytes num PING que pede 8) e flags de codec inválidas no HELLO (0 e 4);
@@ -487,13 +570,13 @@ Na raiz do repositório:
 dotnet test host
 ```
 
-(Se você já estiver dentro da pasta `host`, basta `dotnet test`.) O resultado esperado é **26 testes aprovados e nenhum com falha**. A última linha da saída fica assim; o tempo muda a cada execução e, num .NET em inglês, ela começa com `Passed!` e usa `Failed`, `Passed` e `Skipped`:
+(Se você já estiver dentro da pasta `host`, basta `dotnet test`.) O resultado esperado é **95 testes aprovados e nenhum com falha**. A última linha da saída fica assim; o tempo muda a cada execução e, num .NET em inglês, ela começa com `Passed!` e usa `Failed`, `Passed` e `Skipped`:
 
 ```
-Aprovado!  – Com falha:     0, Aprovado:    26, Ignorado:     0, Total:    26, Duração: 34 ms - ScreenShare.Tests.dll (net10.0)
+Aprovado!  – Com falha:     0, Aprovado:    95, Ignorado:     0, Total:    95, Duração: 4 s - ScreenShare.Tests.dll (net10.0)
 ```
 
-**O que falta.** No lado C#, a Parte 1 está completa: as 7 mensagens do protocolo, o `MessageCodec` e o `MessageReader`. O que ainda não existe é o resto do sistema (rede, captura, vídeo, toque), que vem nas próximas partes do roteiro. A tabela "Roteiro das partes", no plano da Parte 1 (em `docs/superpowers/plans/`), resume o que cada uma entrega, e cada parte ganha o seu plano quando chegar a vez dela:
+**O que falta.** No lado C#, a Parte 1 está completa (as mensagens do protocolo, o `MessageCodec` e o `MessageReader`) e o pareamento por QR com TLS já funciona no host de desenvolvimento. O que ainda não existe é o resto do sistema (captura, vídeo, toque), que vem nas próximas partes do roteiro. A tabela "Roteiro das partes", no plano da Parte 1 (em `docs/superpowers/plans/`), resume o que cada uma entrega, e cada parte ganha o seu plano quando chegar a vez dela:
 
 - **Parte 2 — Monitor virtual:** instalar o Virtual Display Driver (VDD) e criar o `DisplayManager`, que ativa e ajusta o monitor virtual no Windows.
 - **Parte 3 — Vídeo no Wi-Fi:** captura da tela, encode, conexão TCP, decodificação no celular, descoberta automática (mDNS) e overlay de latência. É aqui que o `MessageReader` passa a ler de uma conexão de verdade.
