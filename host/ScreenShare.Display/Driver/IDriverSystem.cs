@@ -6,7 +6,7 @@ namespace ScreenShare.Display.Driver;
 /// </summary>
 public interface IDriverSystem
 {
-    /// <summary>Existe um dispositivo Root\MttVDD presente? Não exige administrador.</summary>
+    /// <summary>Existe um dispositivo Root\MttVDD presente e com driver? Não exige administrador.</summary>
     bool IsInstalled();
 
     Task<byte[]> DownloadAsync(Uri url, CancellationToken cancellationToken);
