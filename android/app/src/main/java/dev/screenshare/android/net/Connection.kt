@@ -19,12 +19,14 @@ import dev.screenshare.android.security.PairedPc
 import dev.screenshare.android.security.PinnedTrustManager
 import java.io.IOException
 import java.io.OutputStream
+import java.net.ConnectException
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.net.SocketTimeoutException
 import java.security.cert.CertificateException
 import javax.net.ssl.SSLException
 import javax.net.ssl.SSLSocket
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -167,6 +169,10 @@ class Connection(
             fail("Conexão perdida")
         } catch (e: IOException) { // inclui ProtocolException, EOFException e erros de TLS
             fail(e.describe())
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) { // nada deve escapar da corrotina e derrubar o app
+            fail("Erro inesperado na conexão: ${e.message ?: e.javaClass.simpleName}")
         } finally {
             raw.closeQuietly()
         }
@@ -201,6 +207,9 @@ class Connection(
     }
 
     private fun IOException.describe() = when {
+        this is ConnectException ->
+            "Não foi possível conectar ao PC. No cabo, rode adb reverse tcp:$USB_PORT tcp:$USB_PORT; " +
+                "no Wi-Fi, confira se o ScreenShare está aberto no PC."
         this is SocketTimeoutException ->
             "O PC não respondeu a tempo. Se a conexão anterior caiu agora, espere uns 10 segundos e tente de novo."
         this is ProtocolException -> "Resposta inválida do PC: $message"

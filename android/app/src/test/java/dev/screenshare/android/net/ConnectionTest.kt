@@ -175,7 +175,7 @@ class ConnectionTest {
         connection.connect(ConnectTarget.Usb(PairedPc("PC de teste", hostFingerprint, TOKEN, null), port))
         val state = connection.await { it is ConnectionState.Failed }
 
-        assertTrue((state as ConnectionState.Failed).reason.isNotBlank())
+        assertTrue((state as ConnectionState.Failed).reason.startsWith("Não foi possível conectar ao PC."))
     }
 
     @Test
@@ -281,7 +281,11 @@ class ConnectionTest {
 
     @Test
     fun serverThatNeverAnswersHelloFailsWithATimeoutMessageInPortuguese() = runBlocking {
-        val serverSide = servingTls { _, _ -> Thread.sleep(3_000) } // aceita e nunca responde (> handshakeTimeoutMs)
+        val serverSide = servingTls { _, reader ->
+            reader.read() // AUTH
+            reader.read() // HELLO
+            Thread.sleep(3_000) // nunca manda o CONFIG (> handshakeTimeoutMs)
+        }
         val connection = newConnection()
 
         connection.connect(usb())
@@ -332,6 +336,40 @@ class ConnectionTest {
             assertTrue("o PC recebeu dados: $received", received!!.isFailure || received!!.getOrNull() == null)
         } finally {
             otherServer.close()
+        }
+    }
+
+    @Test
+    fun usbToPlainTcpSquatterFailsWithoutSendingTheToken() = runBlocking {
+        val squatter = java.net.ServerSocket(0, 1, java.net.InetAddress.getLoopbackAddress())
+        try {
+            val received = java.io.ByteArrayOutputStream()
+            val serverSide = scope.async {
+                squatter.accept().use { socket ->
+                    socket.soTimeout = 500
+                    val buffer = ByteArray(4096)
+                    try {
+                        while (true) {
+                            val n = socket.getInputStream().read(buffer)
+                            if (n < 0) break
+                            received.write(buffer, 0, n)
+                        }
+                    } catch (_: java.net.SocketTimeoutException) {
+                    } catch (_: java.io.IOException) {
+                    }
+                }
+            }
+            val connection = newConnection()
+
+            connection.connect(ConnectTarget.Usb(PairedPc("PC de teste", hostFingerprint, TOKEN, null), port = squatter.localPort))
+            connection.await { it is ConnectionState.Failed }
+            serverSide.await()
+
+            val bytes = received.toByteArray()
+            val leaked = (0..bytes.size - TOKEN.size).any { i -> TOKEN.indices.all { bytes[i + it] == TOKEN[it] } }
+            assertTrue("a chave vazou para um servidor sem TLS", !leaked)
+        } finally {
+            squatter.close()
         }
     }
 
