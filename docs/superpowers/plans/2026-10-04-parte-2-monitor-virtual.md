@@ -687,6 +687,8 @@ git push
 
 ### Task 3: instalação do driver (`install-driver`, `uninstall-driver`, `restart-driver`)
 
+> **Nota da execução (revisão da Task 3):** o código final difere deste texto em cinco pontos corrigidos na revisão: a constante de `TRUST_NOT_ESTABLISHED` (0xE0000242, já corrigida abaixo); o catálogo lido antes de instalar; dispositivo sem driver não conta como instalado e é removido antes de criar outro; `restart-driver` sem dispositivo devolve erro; `ElevatedCommand` não lança e não reabre o `dotnet.exe` (`CanRelaunch`). Veja o commit `53f3577`.
+
 **Files:**
 - Modify: `host/ScreenShare.Display/ScreenShare.Display.csproj` (pacote `System.Security.Cryptography.Pkcs`)
 - Create: `host/ScreenShare.Display/Driver/VddPackage.cs`
@@ -812,7 +814,7 @@ public sealed class DriverInstallerTests
     [Theory]
     [InlineData(1223)]                           // ERROR_CANCELLED
     [InlineData(unchecked((int)0xE0000243))]     // ERROR_AUTHENTICODE_PUBLISHER_NOT_TRUSTED
-    [InlineData(unchecked((int)0xE0000244))]     // ERROR_AUTHENTICODE_TRUST_NOT_ESTABLISHED
+    [InlineData(unchecked((int)0xE0000242))]     // ERROR_AUTHENTICODE_TRUST_NOT_ESTABLISHED (0xE0000244 é SIGNATURE_OSATTRIBUTE_MISMATCH)
     public async Task Declined_confirmation_is_reported_as_user_declined(int error)
     {
         _system.InstallError = error;
@@ -1057,7 +1059,7 @@ public sealed class DriverInstaller(IDriverSystem system, Action<string> log, st
     // Erros do Windows que significam "o usuário disse não" na confirmação de instalação do driver.
     private const int ErrorCancelled = 1223;
     private const int ErrorAuthenticodePublisherNotTrusted = unchecked((int)0xE0000243);
-    private const int ErrorAuthenticodeTrustNotEstablished = unchecked((int)0xE0000244);
+    private const int ErrorAuthenticodeTrustNotEstablished = unchecked((int)0xE0000242);
 
     public async Task<DriverExitCode> InstallAsync(string userSid, CancellationToken cancellationToken = default)
     {
