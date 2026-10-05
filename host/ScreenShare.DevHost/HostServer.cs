@@ -183,6 +183,10 @@ public sealed class HostServer : IDisposable
         // A leitura, o PING e o prazo do fallback começam já: enquanto o vídeo abre, o celular é atendido.
         var reading = ReadLoopAsync(reader, writer, video, session.Token);
         _ = PingAsync(writer, session.Token);
+        // A abertura do vídeo tem cancelamento próprio: se o celular sair enquanto ela demora, ela é cancelada antes de
+        // o vídeo ser encerrado, e o escritor só para depois.
+        using var opening = CancellationTokenSource.CreateLinkedTokenSource(session.Token);
+        var starting = Task.CompletedTask;
         try
         {
             if (_video is null)
@@ -192,20 +196,36 @@ public sealed class HostServer : IDisposable
             else
             {
                 _ = SendFallbackLaterAsync(writer, fallback, session.Token);
-                var started = await StartVideoAsync(new VideoRequest(lease, hello.SupportedCodecs, link), new WriterOutput(writer), session.Token);
-                video.Start(started);
-                if (started is null) writer.SendFallbackConfig(fallback);
+                starting = AttachVideoAsync(new VideoRequest(lease, hello.SupportedCodecs, link), writer, video, fallback, opening.Token);
             }
-            // O que terminar primeiro encerra a sessão: o cliente (fim, prazo, protocolo) ou o escritor (rede).
-            await await Task.WhenAny(reading, writing);
+            // O que terminar primeiro encerra a sessão: o cliente (fim, prazo, protocolo) ou o escritor (rede). A abertura
+            // do vídeo terminar não encerra nada; a sessão segue esperando os outros dois.
+            var first = await Task.WhenAny(reading, writing, starting);
+            if (first == starting)
+            {
+                await starting;
+                first = await Task.WhenAny(reading, writing);
+            }
+            await first;
         }
         finally
         {
+            await opening.CancelAsync();
+            await IgnoreErrorsAsync(starting); // um vídeo que terminou de abrir agora entra em video e é encerrado abaixo
             await video.StopAsync(); // nunca lança: o resto do encerramento sempre acontece
             await session.CancelAsync();
             await IgnoreErrorsAsync(writing);
             await IgnoreErrorsAsync(reading);
         }
+    }
+
+    /// <summary>Abre o vídeo e o liga à sessão; sem vídeo (falha ou sem encoder), o celular recebe o CONFIG de fallback.</summary>
+    private async Task AttachVideoAsync(VideoRequest request, SessionWriter writer, SessionVideo video, ConfigMessage fallback,
+        CancellationToken cancellationToken)
+    {
+        var started = await StartVideoAsync(request, new WriterOutput(writer), cancellationToken);
+        video.Start(started);
+        if (started is null) writer.SendFallbackConfig(fallback);
     }
 
     /// <summary>Começa o vídeo da sessão; uma falha vira sessão sem vídeo (o celular recebe o CONFIG de fallback).</summary>

@@ -645,6 +645,28 @@ public sealed class HostServerTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task Phone_that_leaves_while_the_video_is_starting_ends_the_session()
+    {
+        _video.Enabled = true;
+        _video.StartGate = new TaskCompletionSource(); // a abertura nunca termina sozinha
+        _monitors.Monitor = new VirtualMonitor(@"\\.\DISPLAY9", 3440, 0, 2400, 1080, 175);
+        var (client, stream, _) = await ConnectUsbAuthedAsync();
+        await SendAsync(stream, Hello());
+        await WaitUntilAsync(() => _video.Started.Count == 1);
+
+        client.Dispose();
+
+        await WaitUntilAsync(() => _monitors.Released == 1);
+    }
+
+    [Fact]
+    public void Ping_interval_must_be_positive()
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            new HostServer(0, 0, _identity, _pairing, _devices, pingInterval: TimeSpan.Zero));
+    }
+
+    [Fact]
     public async Task Video_that_fails_to_start_gets_the_fallback_config()
     {
         _video.ThrowOnStart = new InvalidOperationException("falha falsa ao abrir");
