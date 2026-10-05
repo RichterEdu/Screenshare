@@ -41,6 +41,9 @@ internal static class DxgiErrors
         _ => DxgiErrorKind.CaptureLost,
     };
 
+    /// <summary>A placa de vídeo foi removida ou reiniciada (vale também para os erros que o encoder repassa).</summary>
+    public static bool IsDeviceLost(int hresult) => Classify(hresult) == DxgiErrorKind.DeviceLost;
+
     /// <summary>A exceção que o pipeline entende: CaptureLostException (reabrir) ou DeviceLostException (recriar tudo).</summary>
     public static Exception ToException(int hresult, string what, Exception? inner = null)
     {
