@@ -2,6 +2,8 @@ package dev.screenshare.android.net
 
 import android.app.Application
 import android.os.Build
+import android.util.DisplayMetrics
+import android.view.WindowManager
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import dev.screenshare.android.pairing.PairingUri
@@ -34,7 +36,7 @@ class ConnectionViewModel(application: Application) : AndroidViewModel(applicati
     val message: StateFlow<String?> = _message.asStateFlow()
 
     private val connection = Connection(
-        viewModelScope, landscapeScreenInfo(application),
+        viewModelScope, screen = { landscapeScreenInfo(application) },
         // Roda na thread de IO dentro da conexão: não pode lançar (derrubaria o app), então só muda estado e dispara o salvamento.
         onPaired = { pc ->
             persist("Não foi possível salvar o pareamento") { store.save(pc) }
@@ -122,13 +124,24 @@ class ConnectionViewModel(application: Application) : AndroidViewModel(applicati
     }
 
     private companion object {
-        /** A tela do celular é usada como monitor na horizontal: largura é sempre o lado maior. */
+        /**
+         * O painel inteiro da tela em uso, na horizontal (largura = lado maior), para o PC criar o monitor com um pixel
+         * por pixel: inclui a área do recorte da câmera e das barras, que a tela imersiva também cobre.
+         */
         fun landscapeScreenInfo(application: Application): ScreenInfo {
-            val metrics = application.resources.displayMetrics
+            val windowManager = application.getSystemService(WindowManager::class.java)
+            val (width, height) = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                windowManager.maximumWindowMetrics.bounds.let { it.width() to it.height() }
+            } else {
+                val metrics = DisplayMetrics()
+                @Suppress("DEPRECATION")
+                windowManager.defaultDisplay.getRealMetrics(metrics)
+                metrics.widthPixels to metrics.heightPixels
+            }
             return ScreenInfo(
-                width = maxOf(metrics.widthPixels, metrics.heightPixels),
-                height = minOf(metrics.widthPixels, metrics.heightPixels),
-                densityDpi = metrics.densityDpi,
+                width = maxOf(width, height),
+                height = minOf(width, height),
+                densityDpi = application.resources.displayMetrics.densityDpi,
             )
         }
     }

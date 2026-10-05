@@ -5,7 +5,9 @@ import dev.screenshare.android.protocol.AuthMessage
 import dev.screenshare.android.protocol.ConfigMessage
 import dev.screenshare.android.protocol.DeniedMessage
 import dev.screenshare.android.protocol.DeniedReason
+import dev.screenshare.android.protocol.FrameMessage
 import dev.screenshare.android.protocol.HelloMessage
+import dev.screenshare.android.protocol.KeyframeRequestMessage
 import dev.screenshare.android.protocol.Message
 import dev.screenshare.android.protocol.MessageCodec
 import dev.screenshare.android.protocol.MessageReader
@@ -17,6 +19,8 @@ import dev.screenshare.android.protocol.ProtocolException
 import dev.screenshare.android.protocol.VideoCodec
 import dev.screenshare.android.security.PairedPc
 import dev.screenshare.android.security.PinnedTrustManager
+import dev.screenshare.android.video.ClockSync
+import dev.screenshare.android.video.VideoSink
 import java.io.EOFException
 import java.io.IOException
 import java.io.OutputStream
@@ -41,8 +45,8 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
-/** Tamanho e densidade da tela do celular, enviados ao PC no HELLO. */
-data class ScreenInfo(val width: Int, val height: Int, val densityDpi: Int)
+/** Tamanho e densidade da tela do celular e os codecs que ele decodifica, enviados ao PC no HELLO. */
+data class ScreenInfo(val width: Int, val height: Int, val densityDpi: Int, val codecs: Int = VideoCodec.ALL)
 
 sealed interface ConnectionState {
     data object Disconnected : ConnectionState
@@ -75,14 +79,19 @@ sealed interface ConnectTarget {
 
 /**
  * Conexão com o host: (TLS + PAIR/AUTH, no Wi-Fi e no USB) → HELLO → CONFIG, depois PING periódico para medir a latência.
+ * Depois do CONFIG: responde o PING do PC com PONG (e acerta o relógio por ele), entrega CONFIGs novos e FRAMEs ao
+ * [sink] e derruba a conexão se o PC ficar mudo por [idleTimeoutMs] (ele pinga a cada segundo).
  * Uma conexão por vez; chamar [connect] de novo encerra a anterior.
+ * [screen] é lido a cada conexão (a tela em uso pode mudar num dobrável).
  * [onPaired] é chamado (na thread de IO) quando um pareamento termina, com os dados a salvar.
  */
 class Connection(
     private val scope: CoroutineScope,
-    private val screen: ScreenInfo,
+    private val screen: () -> ScreenInfo,
     private val pingIntervalMs: Long = 1_000,
     private val handshakeTimeoutMs: Int = 5_000,
+    private val idleTimeoutMs: Int = 5_000,
+    private val sink: VideoSink = VideoSink.NONE,
     private val onPaired: (PairedPc) -> Unit = {},
 ) {
     private val _state = MutableStateFlow<ConnectionState>(ConnectionState.Disconnected)
@@ -91,11 +100,32 @@ class Connection(
     private var job: Job? = null
     private var socket: Socket? = null
 
+    @Volatile
+    private var output: OutputStream? = null
+
+    /** O relógio do PC visto do celular, para a latência do vídeo. Recomeça a cada conexão. */
+    @Volatile
+    var clock = ClockSync()
+        private set
+
     fun connect(target: ConnectTarget) {
         disconnect()
+        clock = ClockSync()
         _state.value = ConnectionState.Connecting
         val s = Socket().also { socket = it } // guardado já aqui para disconnect() poder interromper o connect
         job = scope.launch(Dispatchers.IO) { run(s, target) }
+    }
+
+    /** Pede ao PC um quadro completo (decoder novo ou com erro). Não bloqueia; sem conexão, não faz nada. */
+    fun requestKeyframe() {
+        val out = output ?: return
+        scope.launch(Dispatchers.IO) {
+            try {
+                out.send(KeyframeRequestMessage)
+            } catch (_: IOException) {
+                // a leitura percebe a queda e trata
+            }
+        }
     }
 
     fun disconnect() {
@@ -142,17 +172,20 @@ class Connection(
                 }
             }
 
-            out.send(HelloMessage(MessageCodec.PROTOCOL_VERSION, screen.width, screen.height, screen.densityDpi, VideoCodec.ALL))
+            val info = screen()
+            out.send(HelloMessage(MessageCodec.PROTOCOL_VERSION, info.width, info.height, info.densityDpi, info.codecs))
             val config = when (val reply = reader.read()) {
                 is ConfigMessage -> reply
                 is DeniedMessage -> return denied(reply.reason)
                 else -> return fail("O PC recusou a conexão")
             }
 
-            s.soTimeout = 0 // daqui em diante a leitura bloqueia até chegar um PONG ou a conexão cair
+            s.soTimeout = idleTimeoutMs // o PC pinga a cada segundo: mudo por mais que isso é conexão morta
             // disconnect() pode ter corrido com a leitura do CONFIG: não publicar Connected depois de Disconnected
             if (!currentCoroutineContext().isActive) return
             _state.value = ConnectionState.Connected(config, rttMs = null)
+            output = out
+            sink.onConfig(config)
             val pinger = scope.launch(Dispatchers.IO) {
                 while (isActive) {
                     delay(pingIntervalMs)
@@ -166,14 +199,29 @@ class Connection(
             }
             try {
                 while (true) {
-                    val message = reader.read() ?: break
-                    if (message is PongMessage) {
-                        val rtt = (nowMicros() - message.timestampUs) / 1_000.0
-                        _state.update { if (it is ConnectionState.Connected) it.copy(rttMs = rtt) else it }
+                    when (val message = reader.read() ?: break) {
+                        is PingMessage -> {
+                            val received = nowMicros()
+                            out.send(PongMessage(message.timestampUs))
+                            clock.onPcPing(message.timestampUs, received)
+                        }
+                        is PongMessage -> {
+                            val now = nowMicros()
+                            clock.onRtt(now - message.timestampUs, now)
+                            val rtt = (now - message.timestampUs) / 1_000.0
+                            _state.update { if (it is ConnectionState.Connected) it.copy(rttMs = rtt) else it }
+                        }
+                        is ConfigMessage -> { // o PC recomeçou o vídeo (resolução nova, encoder novo)
+                            _state.update { if (it is ConnectionState.Connected) it.copy(config = message) else it }
+                            sink.onConfig(message)
+                        }
+                        is FrameMessage -> sink.onFrame(message)
+                        else -> Unit // nada mais vem do PC depois do CONFIG
                     }
                 }
             } finally {
                 pinger.cancel()
+                output = null
             }
             fail("Conexão perdida")
         } catch (e: IOException) { // inclui ProtocolException, EOFException e erros de TLS

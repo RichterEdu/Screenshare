@@ -5,7 +5,9 @@ import dev.screenshare.android.protocol.AuthMessage
 import dev.screenshare.android.protocol.ConfigMessage
 import dev.screenshare.android.protocol.DeniedMessage
 import dev.screenshare.android.protocol.DeniedReason
+import dev.screenshare.android.protocol.FrameMessage
 import dev.screenshare.android.protocol.HelloMessage
+import dev.screenshare.android.protocol.KeyframeRequestMessage
 import dev.screenshare.android.protocol.Message
 import dev.screenshare.android.protocol.MessageCodec
 import dev.screenshare.android.protocol.MessageReader
@@ -16,6 +18,7 @@ import dev.screenshare.android.protocol.PongMessage
 import dev.screenshare.android.protocol.VideoCodec
 import dev.screenshare.android.security.PairedPc
 import dev.screenshare.android.security.TestTls
+import dev.screenshare.android.video.VideoSink
 import java.net.Socket
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -40,6 +43,7 @@ class ConnectionTest {
     private val config = ConfigMessage(2400, 1080, VideoCodec.H264, 8000, ByteArray(0))
     private val hostFingerprint = TestTls.fingerprint("host")
     private val paired = mutableListOf<PairedPc>()
+    private val video = RecordingSink()
 
     @After
     fun tearDown() {
@@ -47,10 +51,39 @@ class ConnectionTest {
         tlsServer.close()
     }
 
-    private fun newConnection() = Connection(
-        scope, screen, pingIntervalMs = 20, handshakeTimeoutMs = 2_000,
+    private fun newConnection(idleTimeoutMs: Int = 5_000, currentScreen: () -> ScreenInfo = { screen }) = Connection(
+        scope, currentScreen, pingIntervalMs = 20, handshakeTimeoutMs = 2_000, idleTimeoutMs = idleTimeoutMs, sink = video,
         onPaired = { synchronized(paired) { paired.add(it) } },
     )
+
+    /** Guarda o que a conexão entregou ao vídeo. */
+    private class RecordingSink : VideoSink {
+        val received = mutableListOf<Message>()
+
+        override fun onConfig(config: ConfigMessage) {
+            synchronized(received) { received.add(config) }
+        }
+
+        override fun onFrame(frame: FrameMessage) {
+            synchronized(received) { received.add(frame) }
+        }
+
+        fun snapshot(): List<Message> = synchronized(received) { received.toList() }
+    }
+
+    /** Espera o vídeo receber [count] mensagens (até 5 s). */
+    private suspend fun RecordingSink.awaitCount(count: Int): List<Message> = withTimeout(5_000) {
+        while (snapshot().size < count) kotlinx.coroutines.delay(10)
+        snapshot()
+    }
+
+    /** Lê do cliente até chegar uma mensagem que não seja o PING periódico dele. */
+    private fun MessageReader.readSkippingPings(): Message? {
+        while (true) {
+            val message = read()
+            if (message !is PingMessage) return message
+        }
+    }
 
     private fun usb() = ConnectTarget.Usb(PairedPc("PC de teste", hostFingerprint, TOKEN, null), port = tlsServer.localPort)
 
@@ -412,6 +445,115 @@ class ConnectionTest {
         connection.await { it is ConnectionState.Connected }
 
         assertEquals(listOf(PairedPc("PC de teste", hostFingerprint, TOKEN, "192.168.0.10")), synchronized(paired) { paired.toList() })
+        connection.disconnect()
+        serverSide.await()
+    }
+
+    @Test
+    fun pcPingIsAnsweredWithAPongOfTheSameValue() = runBlocking {
+        var answer: Message? = null
+        val serverSide = servingTls { socket, reader ->
+            reader.read() // AUTH
+            reader.read() // HELLO
+            socket.send(config)
+            socket.send(PingMessage(123_456_789))
+            while (true) {
+                val message = reader.read() ?: break
+                if (message is PongMessage && message.timestampUs == 123_456_789L) {
+                    answer = message
+                    break
+                }
+            }
+        }
+        val connection = newConnection()
+
+        connection.connect(usb())
+        serverSide.await()
+
+        assertEquals(PongMessage(123_456_789), answer)
+        connection.disconnect()
+    }
+
+    @Test
+    fun configAndFramesReachTheVideoInOrderAndANewConfigUpdatesTheState() = runBlocking {
+        val newConfig = ConfigMessage(1920, 1080, VideoCodec.H265, 25_000, byteArrayOf(0, 0, 0, 1, 0x40, 0x01))
+        val key = FrameMessage(10, true, byteArrayOf(0, 0, 0, 1, 0x26, 0x01))
+        val p = FrameMessage(20, false, byteArrayOf(0, 0, 0, 1, 0x02, 0x01))
+        val serverSide = servingTls { socket, reader ->
+            reader.read() // AUTH
+            reader.read() // HELLO
+            socket.send(config)
+            socket.send(key)
+            socket.send(p)
+            socket.send(newConfig)
+            while (reader.read() != null) { /* até o cliente fechar */ }
+        }
+        val connection = newConnection()
+
+        connection.connect(usb())
+        val received = video.awaitCount(4)
+        val state = connection.await { it is ConnectionState.Connected && it.config == newConfig }
+
+        assertEquals(listOf(config, key, p, newConfig), received)
+        assertEquals(newConfig, (state as ConnectionState.Connected).config)
+        connection.disconnect()
+        serverSide.await()
+    }
+
+    @Test
+    fun requestKeyframeSendsTheMessage() = runBlocking {
+        var request: Message? = null
+        val serverSide = servingTls { socket, reader ->
+            reader.read() // AUTH
+            reader.read() // HELLO
+            socket.send(config)
+            request = reader.readSkippingPings()
+        }
+        val connection = newConnection()
+        connection.connect(usb())
+        connection.await { it is ConnectionState.Connected }
+
+        connection.requestKeyframe()
+        serverSide.await()
+
+        assertEquals(KeyframeRequestMessage, request)
+        connection.disconnect()
+    }
+
+    @Test
+    fun silentPcAfterTheConfigIsDroppedAfterTheIdleTimeout() = runBlocking {
+        val serverSide = servingTls { socket, reader ->
+            reader.read() // AUTH
+            reader.read() // HELLO
+            socket.send(config)
+            Thread.sleep(1_500) // não responde PING nem manda nada
+        }
+        val connection = newConnection(idleTimeoutMs = 300)
+
+        connection.connect(usb())
+        val state = connection.await { it is ConnectionState.Failed }
+
+        assertTrue(state is ConnectionState.Failed)
+        serverSide.await()
+    }
+
+    @Test
+    fun helloCarriesTheScreenAndCodecsReadAtConnectTime() = runBlocking {
+        var received: Message? = null
+        val serverSide = servingTls { socket, reader ->
+            reader.read() // AUTH
+            received = reader.read()
+            socket.send(config)
+            reader.read()
+        }
+        var current = ScreenInfo(2520, 1080, 432, VideoCodec.H264)
+        val connection = newConnection(currentScreen = { current })
+        current = ScreenInfo(2504, 2256, 432, VideoCodec.H264) // a tela mudou antes de conectar (dobrável aberto)
+
+        connection.connect(usb())
+        connection.await { it is ConnectionState.Connected }
+
+        assertEquals(HelloMessage(MessageCodec.PROTOCOL_VERSION, 2504, 2256, 432, VideoCodec.H264), received)
         connection.disconnect()
         serverSide.await()
     }
