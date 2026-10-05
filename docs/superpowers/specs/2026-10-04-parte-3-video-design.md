@@ -44,7 +44,7 @@ Ponto de partida:
    - A `SurfaceView` cobre o recorte da câmera (`LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES`) e usa `holder.setFixedSize(w, h)`.
 8. **Conversão para NV12 na GPU** com `ID3D11VideoProcessor` (BGRA full range → NV12 BT.709 limitado), com o processamento automático desligado para não mexer no texto. As amostras de entrada vêm de um pool (`MFCreateVideoSampleAllocatorEx`). O encoder é um **MFT assíncrono**, com uma thread própria de eventos.
 9. **SPS, PPS e VPS do `CONFIG`** são tirados do primeiro IDR (`AnnexB.ExtractParameterSets`). Não confiar em `MF_MT_MPEG_SEQUENCE_HEADER`, que costuma vir vazio em encoders de hardware.
-10. **GOP é contado em quadros, não em segundos.** `CODECAPI_AVEncMPVGOPSize` = 2 × fps. Como os quadros só vêm com mudança, o intervalo real entre IDRs varia; o spike registra o tamanho dos IDRs.
+10. **Sem IDR periódico.** O GOP vai no maior valor aceito (`CODECAPI_AVEncMPVGOPSize` = `int.MaxValue`): keyframes só no começo do stream, num `KEYFRAME_REQ`, depois de um descarte na fila ou numa reabertura (decisão do spike, ver "Decisões a partir do spike").
 
 ## Componentes — PC
 
@@ -89,7 +89,7 @@ Ponto de partida:
   - `MediaFoundationEncoder`:
     - `MFTEnumEx` de hardware, filtrado pelo LUID ou pelo fornecedor;
     - `MF_TRANSFORM_ASYNC_UNLOCK` e `MF_LOW_LATENCY`;
-    - `CODECAPI_AVLowLatencyMode`, B-frames = 0, GOP = 2 × fps;
+    - `CODECAPI_AVLowLatencyMode`, sem B-frames (o NVENC não usa em baixa latência), GOP no maior valor aceito;
     - modo de bitrate `PeakConstrainedVBR` ou `LowDelayVBR` (o spike escolhe), com `MaxQP` se suportado;
     - tipo de saída antes do de entrada; VUI BT.709 limitado;
     - IDR forçado com `CODECAPI_AVEncVideoForceKeyFrame`;

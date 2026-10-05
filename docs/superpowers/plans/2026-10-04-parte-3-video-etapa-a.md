@@ -6343,9 +6343,14 @@ git push
 - Consumes: `IVideoEncoder`, `IVideoBackend`, `EncoderSettings`, `EncodedFrame`, `EncoderUnavailableException`, `PipelineVideoSource` e `CodecChooser` (Task 6); `GpuContext`, `GpuImage`, `DxgiOutputLocator`, `DesktopDuplicationCapture`, `DxgiErrors` e `CaptureThread` (Task 7); `AnnexB.IsKeyframe` (Task 2).
 - Produces (a Task 9 usa):
   - `public static VideoSourceFactory.CreateDefault(VideoOptions options, Action<string> log) → IVideoSource?` (null sem encoder de hardware);
-  - `internal EncoderCatalog.HardwareCodecs`, `Find(VideoCodec, uint vendorId)` e `NameOf(IMFActivate)`;
+  - `internal EncoderCatalog.HardwareCodecs`, `Find(VideoCodec, uint vendorId, long adapterLuid)` (prefere o encoder da mesma placa) e `NameOf(IMFActivate)`;
   - `internal MediaFoundationEncoder(GpuContext, IMFActivate, EncoderSettings) : IVideoEncoder`;
   - `internal HardwareBackend : IVideoBackend`.
+
+**Regras desta task (da revisão da própria Task 8):**
+- a amostra de saída que o Vortice devolve é um objeto novo sem AddRef: se ela é a nossa (encoder que não fornece amostras), não pode ser liberada de novo (`ReleaseOutputSample`), senão o processo cai;
+- o construtor do encoder solta tudo o que criou e chama `ShutdownObject` se algo falhar no meio; o `HardwareBackend` transforma qualquer falha do construtor (que não seja placa perdida) em `EncoderUnavailableException`;
+- depois de um STREAM_CHANGE, a saída é pedida de novo, para não perder o quadro.
 
 **Regra desta task (da revisão da Task 6):** os erros de placa removida ou reiniciada (`DxgiErrors.IsDeviceLost`: DEVICE_REMOVED, HUNG, RESET, DRIVER_INTERNAL_ERROR) que o encoder vê no `Submit`, no evento de erro do MFT ou ao ser criado viram `DeviceLostException`, para o pipeline recriar a placa e não só o encoder. `DxgiErrors.cs` (Task 7) ganha `IsDeviceLost`.
 
@@ -6383,6 +6388,7 @@ using ScreenShare.Video.Pipeline;
 using Vortice.Direct3D11;
 using Vortice.DXGI;
 using Vortice.Mathematics;
+using Vortice.MediaFoundation;
 
 namespace ScreenShare.Tests.Video;
 
@@ -6437,6 +6443,38 @@ public sealed class EncoderTests
         Assert.True(output.Frames[0].IsKeyframe);
     }
 
+    [GpuFact]
+    public void Our_output_sample_returned_by_the_encoder_is_released_only_once()
+    {
+        var own = MediaFactory.MFCreateSample();
+        var returned = new IMFSample(own.NativePointer); // como o Vortice devolve a saída: objeto novo, sem AddRef
+
+        MediaFoundationEncoder.ReleaseOutputSample(returned, own);
+
+        own.AddRef();
+        Assert.Equal(1u, own.Release()); // a única referência continua com o own
+        own.Dispose();
+    }
+
+    [GpuFact]
+    public void Encoder_that_fails_to_configure_releases_everything_and_the_next_one_opens()
+    {
+        using var gpu = GpuContext.Create(null);
+        var activate = EncoderCatalog.Find(VideoCodec.H264, gpu.VendorId, gpu.AdapterLuid);
+        Assert.NotNull(activate);
+
+        Assert.ThrowsAny<Exception>(() =>
+            new MediaFoundationEncoder(gpu, activate, new EncoderSettings(VideoCodec.H264, 16384, 16384, 60, 25_000, 50_000)));
+        using var encoder = new MediaFoundationEncoder(gpu, activate, new EncoderSettings(VideoCodec.H264, 1920, 1080, 60, 25_000, 50_000));
+
+        var deadline = Stopwatch.StartNew();
+        while (!encoder.CanAccept)
+        {
+            Assert.True(deadline.ElapsedMilliseconds < 1000, "o encoder novo não pediu entrada em 1 s");
+            Thread.Sleep(1);
+        }
+    }
+
     private static void AssertEncodes(VideoCodec codec)
     {
         var frames = Encode(codec, count: 30, forceAt: 10);
@@ -6455,7 +6493,7 @@ public sealed class EncoderTests
     private static List<(EncodedFrame Frame, double Ms)> Encode(VideoCodec codec, int count, int forceAt)
     {
         using var gpu = GpuContext.Create(null);
-        var activate = EncoderCatalog.Find(codec, gpu.VendorId);
+        var activate = EncoderCatalog.Find(codec, gpu.VendorId, gpu.AdapterLuid);
         Assert.NotNull(activate);
         using var encoder = new MediaFoundationEncoder(gpu, activate, new EncoderSettings(codec, 2520, 1080, 60, 25_000, 50_000));
         using var texture = gpu.Device.CreateTexture2D(new Texture2DDescription(Format.B8G8R8A8_UNorm, 2520, 1080, 1, 1,
@@ -6619,12 +6657,32 @@ internal static class EncoderCatalog
         }
     }
 
-    /// <summary>O encoder do codec feito pelo mesmo fabricante da placa (0x10DE = NVIDIA), ou null.</summary>
-    public static IMFActivate? Find(VideoCodec codec, uint vendorId)
+    /// <summary>MFT_ENUM_ADAPTER_LUID: a placa a que o encoder de hardware pertence.</summary>
+    private static readonly Guid AdapterLuidKey = new("1d39518c-e220-4da8-a07f-ba172552d6b1");
+
+    /// <summary>
+    /// O encoder do codec na mesma placa (LUID) da captura; se o driver não informar a placa, o primeiro do mesmo
+    /// fabricante (0x10DE = NVIDIA). null se não houver.
+    /// </summary>
+    public static IMFActivate? Find(VideoCodec codec, uint vendorId, long adapterLuid)
     {
         var vendor = $"VEN_{vendorId:X4}";
-        return List(codec).FirstOrDefault(activate =>
-            string.Equals(VendorOf(activate), vendor, StringComparison.OrdinalIgnoreCase));
+        var sameVendor = List(codec)
+            .Where(activate => string.Equals(VendorOf(activate), vendor, StringComparison.OrdinalIgnoreCase))
+            .ToList();
+        return sameVendor.FirstOrDefault(activate => LuidOf(activate) == adapterLuid) ?? sameVendor.FirstOrDefault();
+    }
+
+    private static long? LuidOf(IMFActivate activate)
+    {
+        try
+        {
+            return (long)activate.GetUInt64(AdapterLuidKey);
+        }
+        catch (Exception)
+        {
+            return null;
+        }
     }
 
     public static string NameOf(IMFActivate activate)
@@ -6823,21 +6881,57 @@ internal sealed class MediaFoundationEncoder : IVideoEncoder
     private readonly int _outputSize;
     private readonly Thread _thread;
     private int _inputRequests;
+    private int _disposed;
     private volatile bool _stopping;
 
+    /// <summary>
+    /// Configura e começa o encoder. Se algo falhar no meio, solta tudo o que já criou e desativa o MFT
+    /// (ShutdownObject): sem isso, o IMFActivate devolveria na próxima tentativa o mesmo MFT meio configurado.
+    /// </summary>
     public MediaFoundationEncoder(GpuContext gpu, IMFActivate activate, EncoderSettings settings)
     {
         _settings = settings;
         _activate = activate;
-        _transform = activate.ActivateObject<IMFTransform>();
+        var created = new Stack<IDisposable>();
+        try
+        {
+            _transform = Track(created, activate.ActivateObject<IMFTransform>());
+            _manager = Track(created, MediaFactory.MFCreateDXGIDeviceManager());
+            _api = Track(created, new CodecApi(_transform));
+            _inputType = Track(created, InputType(settings));
+            _allocator = Track(created,
+                new IMFVideoSampleAllocatorEx(MediaFactory.MFCreateVideoSampleAllocatorEx(typeof(IMFVideoSampleAllocatorEx).GUID)));
+            (_providesSamples, _outputSize) = Configure(gpu, settings);
+            _converter = Track(created, new Nv12Converter(gpu, settings.Width, settings.Height, settings.Fps));
+            _transform.ProcessMessage(TMessageType.MessageNotifyBeginStreaming, UIntPtr.Zero);
+            _transform.ProcessMessage(TMessageType.MessageNotifyStartOfStream, UIntPtr.Zero);
+            _events = Track(created, _transform.QueryInterface<IMFMediaEventGenerator>());
+        }
+        catch
+        {
+            while (created.TryPop(out var item)) item.Dispose();
+            activate.ShutdownObject();
+            throw;
+        }
+        _thread = new Thread(RunEvents) { IsBackground = true, Name = "ScreenShare encoder", Priority = ThreadPriority.AboveNormal };
+        _thread.Start();
+    }
+
+    private static T Track<T>(Stack<IDisposable> created, T item) where T : IDisposable
+    {
+        created.Push(item);
+        return item;
+    }
+
+    /// <summary>Atributos, ajustes do ICodecAPI, tipos de saída e de entrada e o pool de amostras NV12.</summary>
+    private (bool ProvidesSamples, int OutputSize) Configure(GpuContext gpu, EncoderSettings settings)
+    {
         _transform.Attributes.Set(TransformAttributeKeys.TransformAsyncUnlock, 1u);
         _transform.Attributes.Set(CodecApi.LowLatency, 1u); // MF_LOW_LATENCY tem o mesmo GUID
 
-        _manager = MediaFactory.MFCreateDXGIDeviceManager();
         _manager.ResetDevice(gpu.Device).CheckError();
         _transform.ProcessMessage(TMessageType.MessageSetD3DManager, (UIntPtr)(nuint)_manager.NativePointer);
 
-        _api = new CodecApi(_transform);
         _api.SetBool(CodecApi.LowLatency, true);
         _api.SetUInt32(CodecApi.GopSize, MaxGop);
         _api.SetUInt32(CodecApi.RateControl, CodecApi.PeakConstrainedVbr);
@@ -6848,13 +6942,9 @@ internal sealed class MediaFoundationEncoder : IVideoEncoder
         _api.SetUInt32(CodecApi.BufferSize, peak / (uint)settings.Fps * 3); // ~3 quadros no pico
 
         using (var outputType = OutputType(settings, bitrate)) _transform.SetOutputType(0, outputType, 0);
-        _inputType = InputType(settings);
         _transform.SetInputType(0, _inputType, 0);
         var info = _transform.GetOutputStreamInfo(0);
-        _providesSamples = (info.Flags & (ProvidesSamples | CanProvideSamples)) != 0;
-        _outputSize = Math.Max(info.Size, settings.Width * settings.Height);
 
-        _allocator = new IMFVideoSampleAllocatorEx(MediaFactory.MFCreateVideoSampleAllocatorEx(typeof(IMFVideoSampleAllocatorEx).GUID));
         _allocator.SetDirectXManager(_manager);
         using (var attributes = MediaFactory.MFCreateAttributes(2))
         {
@@ -6862,13 +6952,7 @@ internal sealed class MediaFoundationEncoder : IVideoEncoder
             attributes.Set(TransformAttributeKeys.D3D11Usage, (uint)ResourceUsage.Default);
             _allocator.InitializeSampleAllocatorEx(3, 6, attributes, _inputType);
         }
-        _converter = new Nv12Converter(gpu, settings.Width, settings.Height, settings.Fps);
-
-        _transform.ProcessMessage(TMessageType.MessageNotifyBeginStreaming, UIntPtr.Zero);
-        _transform.ProcessMessage(TMessageType.MessageNotifyStartOfStream, UIntPtr.Zero);
-        _events = _transform.QueryInterface<IMFMediaEventGenerator>();
-        _thread = new Thread(RunEvents) { IsBackground = true, Name = "ScreenShare encoder", Priority = ThreadPriority.AboveNormal };
-        _thread.Start();
+        return ((info.Flags & (ProvidesSamples | CanProvideSamples)) != 0, Math.Max(info.Size, settings.Width * settings.Height));
     }
 
     public VideoCodec Codec => _settings.Codec;
@@ -6903,6 +6987,7 @@ internal sealed class MediaFoundationEncoder : IVideoEncoder
 
     public void Dispose()
     {
+        if (Interlocked.Exchange(ref _disposed, 1) == 1) return;
         _stopping = true;
         try
         {
@@ -6949,37 +7034,58 @@ internal sealed class MediaFoundationEncoder : IVideoEncoder
         }
     }
 
+    /// <summary>Pega a saída pronta. Depois de uma troca de formato (STREAM_CHANGE) tenta uma vez mais, para não perder o quadro.</summary>
     private void DrainOutput()
     {
-        var buffer = new OutputDataBuffer { StreamID = 0 };
-        IMFSample? own = null;
-        if (!_providesSamples)
+        for (var attempt = 0; attempt < 2; attempt++)
         {
-            own = MediaFactory.MFCreateSample();
-            using var memory = MediaFactory.MFCreateMemoryBuffer(_outputSize);
-            own.AddBuffer(memory);
-            buffer.Sample = own;
-        }
-        try
-        {
-            var result = _transform.ProcessOutput(ProcessOutputFlags.None, 1, ref buffer, out _);
-            if (result.Code == StreamChange)
+            var buffer = new OutputDataBuffer { StreamID = 0 };
+            IMFSample? own = null;
+            if (!_providesSamples)
             {
-                using var available = _transform.GetOutputAvailableType(0, 0);
-                _transform.SetOutputType(0, available, 0);
+                own = MediaFactory.MFCreateSample();
+                using var memory = MediaFactory.MFCreateMemoryBuffer(_outputSize);
+                own.AddBuffer(memory);
+                buffer.Sample = own;
+            }
+            try
+            {
+                var result = _transform.ProcessOutput(ProcessOutputFlags.None, 1, ref buffer, out _);
+                if (result.Code == StreamChange)
+                {
+                    using var available = _transform.GetOutputAvailableType(0, 0);
+                    _transform.SetOutputType(0, available, 0);
+                    continue;
+                }
+                result.CheckError();
+                var data = CopyBytes(buffer.Sample!);
+                var timestamp = (ulong)(buffer.Sample!.SampleTime / 10);
+                Output?.Invoke(new EncodedFrame(timestamp, AnnexB.IsKeyframe(data, _settings.Codec), data));
                 return;
             }
-            result.CheckError();
-            var data = CopyBytes(buffer.Sample!);
-            var timestamp = (ulong)(buffer.Sample!.SampleTime / 10);
-            Output?.Invoke(new EncodedFrame(timestamp, AnnexB.IsKeyframe(data, _settings.Codec), data));
+            finally
+            {
+                buffer.Events?.Dispose();
+                ReleaseOutputSample(buffer.Sample, own);
+                own?.Dispose();
+            }
         }
-        finally
+    }
+
+    /// <summary>
+    /// O Vortice devolve a amostra de saída num objeto novo que não fez AddRef. Se é a nossa (own), esse objeto não pode
+    /// liberar nada: o own já libera a única referência, e liberar duas vezes derruba o processo. Se o MFT forneceu a
+    /// amostra, o objeto novo é a referência que o MFT nos deu, e é liberado uma vez.
+    /// </summary>
+    internal static void ReleaseOutputSample(IMFSample? returned, IMFSample? own)
+    {
+        if (returned is null || ReferenceEquals(returned, own)) return;
+        if (own is not null && returned.NativePointer == own.NativePointer)
         {
-            buffer.Events?.Dispose();
-            if (buffer.Sample is { } sample && !ReferenceEquals(sample, own)) sample.Dispose();
-            own?.Dispose();
+            returned.NativePointer = IntPtr.Zero;
+            return;
         }
+        returned.Dispose();
     }
 
     private static byte[] CopyBytes(IMFSample sample)
@@ -7071,7 +7177,7 @@ internal sealed class HardwareBackend : IVideoBackend
     public IVideoEncoder CreateEncoder(EncoderSettings settings)
     {
         var gpu = _gpu ?? throw new InvalidOperationException("a captura abre antes do encoder");
-        var activate = EncoderCatalog.Find(settings.Codec, gpu.VendorId)
+        var activate = EncoderCatalog.Find(settings.Codec, gpu.VendorId, gpu.AdapterLuid)
             ?? throw new EncoderUnavailableException($"a placa não tem encoder {CodecChooser.Name(settings.Codec)}");
         try
         {
@@ -7084,6 +7190,10 @@ internal sealed class HardwareBackend : IVideoBackend
         catch (SharpGenException e)
         {
             throw new EncoderUnavailableException($"{EncoderCatalog.NameOf(activate)}: 0x{e.HResult:X8}", e);
+        }
+        catch (Exception e) when (e is not DeviceLostException)
+        {
+            throw new EncoderUnavailableException($"{EncoderCatalog.NameOf(activate)}: {e.Message}", e);
         }
     }
 
@@ -7125,14 +7235,15 @@ public static class VideoSourceFactory
 ```
 
 Run: `dotnet test host/ScreenShare.slnx --filter FullyQualifiedName~EncoderTests`
-Expected: 4 ignorados (sem a variável).
+Expected: 6 ignorados (sem a variável).
 
 Run (PowerShell, no PC do usuário): `$env:SCREENSHARE_GPU_TESTS=1; dotnet test host/ScreenShare.slnx --filter "FullyQualifiedName~EncoderTests|FullyQualifiedName~CaptureTests"; Remove-Item Env:SCREENSHARE_GPU_TESTS`
-Expected: 13 aprovados. O que eles conferem:
+Expected: 15 aprovados. O que eles conferem:
 - H.265 e H.264 começam por IDR com os parâmetros;
 - o IDR forçado no quadro 10 sai nesse quadro;
 - o p95 da entrada à saída fica abaixo de 10 ms;
 - 600 quadros saem sem IDR espontâneo;
+- a amostra de saída devolvida pelo encoder é liberada uma vez só, e um encoder que falha ao configurar solta tudo e deixa o próximo abrir;
 - a fábrica captura e codifica o monitor principal de ponta a ponta (`CONFIG` com os parâmetros + IDR).
 
 Se o teste dos 600 quadros falhar (aparecer um IDR sozinho), o encoder não aceitou `MaxGop`. Nesse caso, troque `MaxGop` por `65535` em `MediaFoundationEncoder.cs`, rode de novo e anote no relatório.
@@ -7140,7 +7251,7 @@ Se o teste dos 600 quadros falhar (aparecer um IDR sozinho), o encoder não acei
 - [ ] **Step 6: Rodar tudo, commit e push**
 
 Run: `dotnet build host/ScreenShare.slnx` e `dotnet test host/ScreenShare.slnx`
-Expected: 0 avisos; 340 aprovados e 7 ignorados.
+Expected: 0 avisos; 340 aprovados e 9 ignorados.
 
 ```bash
 git add host/ScreenShare.Video host/ScreenShare.Tests/Video
@@ -7783,7 +7894,7 @@ Em `host/ScreenShare.DevHost/Program.cs`:
 - [ ] **Step 5: Rodar tudo, commit e push**
 
 Run: `dotnet build host/ScreenShare.slnx` e `dotnet test host/ScreenShare.slnx`
-Expected: 0 avisos; 355 aprovados e 7 ignorados.
+Expected: 0 avisos; 355 aprovados e 9 ignorados.
 
 ```bash
 git add host/ScreenShare.DevHost host/ScreenShare.Video host/ScreenShare.Tests
@@ -10653,12 +10764,12 @@ internal sealed class DesktopDuplicationCapture : IScreenCapture
 ```
 
 Run (PowerShell, no PC do usuário): `$env:SCREENSHARE_GPU_TESTS=1; dotnet test host/ScreenShare.slnx; Remove-Item Env:SCREENSHARE_GPU_TESTS`
-Expected: 366 aprovados e 1 ignorado (o teste do driver de monitor virtual).
+Expected: 368 aprovados e 1 ignorado (o teste do driver de monitor virtual).
 
 - [ ] **Step 4: Rodar tudo, commit e push**
 
 Run: `dotnet build host/ScreenShare.slnx` e `dotnet test host/ScreenShare.slnx`
-Expected: 0 avisos; 360 aprovados e 7 ignorados.
+Expected: 0 avisos; 360 aprovados e 9 ignorados.
 
 ```bash
 git add host/ScreenShare.Video host/ScreenShare.Tests/Video
@@ -10725,7 +10836,7 @@ Mantenha o tom e o formato do README atual (pt-BR, emojis nos títulos que já e
 Em `docs/guia-do-codigo.md`:
 - uma seção para o projeto `host/ScreenShare.Video`, com uma linha por arquivo de `Pipeline/` e de `Hardware/` dizendo o que faz;
 - as linhas dos arquivos novos e alterados do Core (`Video/AnnexB.cs`, `Video/PcClock.cs`, `Protocol/VideoSendQueue.cs`, `Protocol/SessionWriter.cs`), do DevHost (`DevHostOptions.cs`, `VideoStatsLine.cs`, `HostServer.cs`) e do app (`video/*.kt`, `net/Connection.kt`, `ui/ImmersiveScreen.kt`);
-- as contagens de testes: 360 aprovados e 7 ignorados no host sem GPU, 366 e 1 com GPU, e 116 no app.
+- as contagens de testes: 360 aprovados e 9 ignorados no host sem GPU, 368 e 1 com GPU, e 116 no app.
 
 Siga o formato de tabela "Arquivo | O que faz" que o guia já usa.
 
