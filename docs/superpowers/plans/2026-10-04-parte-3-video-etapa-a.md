@@ -2916,7 +2916,7 @@ Substitua `host/ScreenShare.Tests/DevHost/HostServerTests.cs` pelo conteúdo aba
 - o fixture passa o vídeo falso, PING do PC a cada 200 ms e fallback em 500 ms;
 - `ReadSkippingPingsAsync` pula o PING do PC nos testes antigos que esperam um PONG ou o fechamento;
 - `FakeMonitorManager.OnRelease`;
-- 12 testes novos, antes de `FakeMonitorManager` (4 deles cobrem: vídeo demorando a abrir, KEYFRAME_REQ antes de o vídeo começar, vídeo que falha ao abrir e vídeo que falha ao encerrar).
+- 14 testes novos, antes de `FakeMonitorManager` (6 deles cobrem: vídeo demorando a abrir, KEYFRAME_REQ antes de o vídeo começar, celular que sai enquanto o vídeo abre, vídeo que falha ao abrir, vídeo que falha ao encerrar e intervalo de PING inválido).
 
 ```csharp
 using System.Net;
@@ -3566,6 +3566,28 @@ public sealed class HostServerTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task Phone_that_leaves_while_the_video_is_starting_ends_the_session()
+    {
+        _video.Enabled = true;
+        _video.StartGate = new TaskCompletionSource(); // a abertura nunca termina sozinha
+        _monitors.Monitor = new VirtualMonitor(@"\\.\DISPLAY9", 3440, 0, 2400, 1080, 175);
+        var (client, stream, _) = await ConnectUsbAuthedAsync();
+        await SendAsync(stream, Hello());
+        await WaitUntilAsync(() => _video.Started.Count == 1);
+
+        client.Dispose();
+
+        await WaitUntilAsync(() => _monitors.Released == 1);
+    }
+
+    [Fact]
+    public void Ping_interval_must_be_positive()
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            new HostServer(0, 0, _identity, _pairing, _devices, pingInterval: TimeSpan.Zero));
+    }
+
+    [Fact]
     public async Task Video_that_fails_to_start_gets_the_fallback_config()
     {
         _video.ThrowOnStart = new InvalidOperationException("falha falsa ao abrir");
@@ -3624,6 +3646,7 @@ Substitua `host/ScreenShare.DevHost/HostServer.cs` pelo conteúdo abaixo. O que 
 - o vídeo e os intervalos entram pelo construtor;
 - `VideoLink` vem da porta;
 - `ServeSessionAsync` cria o escritor e já começa a leitura, o PING e o prazo do fallback; só depois espera o vídeo abrir (o celular é atendido enquanto isso, e o prazo de 2 s conta desde o HELLO);
+- a abertura do vídeo (`AttachVideoAsync`) corre junto com a leitura e a escrita, com cancelamento próprio: se o celular sai enquanto ela demora, ela é cancelada, e um vídeo que termina de abrir nessa hora ainda é encerrado;
 - `SessionVideo` guarda um pedido de keyframe que chega antes de o vídeo começar e o entrega quando ele começa; o `KeyframeNeeded` é assinado antes do vídeo;
 - vídeo que falha ao abrir vira sessão sem vídeo (CONFIG de fallback); falha ao encerrar o vídeo é registrada e não impede o resto do encerramento;
 - o laço de leitura vira `ReadLoopAsync`;
@@ -3816,6 +3839,10 @@ public sealed class HostServer : IDisposable
         // A leitura, o PING e o prazo do fallback começam já: enquanto o vídeo abre, o celular é atendido.
         var reading = ReadLoopAsync(reader, writer, video, session.Token);
         _ = PingAsync(writer, session.Token);
+        // A abertura do vídeo tem cancelamento próprio: se o celular sair enquanto ela demora, ela é cancelada antes de
+        // o vídeo ser encerrado, e o escritor só para depois.
+        using var opening = CancellationTokenSource.CreateLinkedTokenSource(session.Token);
+        var starting = Task.CompletedTask;
         try
         {
             if (_video is null)
@@ -3825,20 +3852,36 @@ public sealed class HostServer : IDisposable
             else
             {
                 _ = SendFallbackLaterAsync(writer, fallback, session.Token);
-                var started = await StartVideoAsync(new VideoRequest(lease, hello.SupportedCodecs, link), new WriterOutput(writer), session.Token);
-                video.Start(started);
-                if (started is null) writer.SendFallbackConfig(fallback);
+                starting = AttachVideoAsync(new VideoRequest(lease, hello.SupportedCodecs, link), writer, video, fallback, opening.Token);
             }
-            // O que terminar primeiro encerra a sessão: o cliente (fim, prazo, protocolo) ou o escritor (rede).
-            await await Task.WhenAny(reading, writing);
+            // O que terminar primeiro encerra a sessão: o cliente (fim, prazo, protocolo) ou o escritor (rede). A abertura
+            // do vídeo terminar não encerra nada; a sessão segue esperando os outros dois.
+            var first = await Task.WhenAny(reading, writing, starting);
+            if (first == starting)
+            {
+                await starting;
+                first = await Task.WhenAny(reading, writing);
+            }
+            await first;
         }
         finally
         {
+            await opening.CancelAsync();
+            await IgnoreErrorsAsync(starting); // um vídeo que terminou de abrir agora entra em video e é encerrado abaixo
             await video.StopAsync(); // nunca lança: o resto do encerramento sempre acontece
             await session.CancelAsync();
             await IgnoreErrorsAsync(writing);
             await IgnoreErrorsAsync(reading);
         }
+    }
+
+    /// <summary>Abre o vídeo e o liga à sessão; sem vídeo (falha ou sem encoder), o celular recebe o CONFIG de fallback.</summary>
+    private async Task AttachVideoAsync(VideoRequest request, SessionWriter writer, SessionVideo video, ConfigMessage fallback,
+        CancellationToken cancellationToken)
+    {
+        var started = await StartVideoAsync(request, new WriterOutput(writer), cancellationToken);
+        video.Start(started);
+        if (started is null) writer.SendFallbackConfig(fallback);
     }
 
     /// <summary>Começa o vídeo da sessão; uma falha vira sessão sem vídeo (o celular recebe o CONFIG de fallback).</summary>
@@ -4047,12 +4090,12 @@ public sealed class HostServer : IDisposable
 ```
 
 Run: `dotnet test host/ScreenShare.slnx --filter FullyQualifiedName~HostServerTests`
-Expected: PASS (35 casos). Rode 3 vezes seguidas: nenhum teste pode falhar (há tempos de 200 e 500 ms envolvidos).
+Expected: PASS (37 casos). Rode 3 vezes seguidas: nenhum teste pode falhar (há tempos de 200 e 500 ms envolvidos).
 
 - [ ] **Step 6: Rodar tudo, commit e push**
 
 Run: `dotnet build host/ScreenShare.slnx` e `dotnet test host/ScreenShare.slnx`
-Expected: 0 avisos; 291 aprovados e 1 ignorado.
+Expected: 0 avisos; 293 aprovados e 1 ignorado.
 
 ```bash
 git add host/ScreenShare.slnx host/ScreenShare.Video host/ScreenShare.Core/Protocol/SessionWriter.cs host/ScreenShare.DevHost host/ScreenShare.Tests
@@ -5525,7 +5568,7 @@ Expected: PASS. São 33 casos novos: `VideoPipelineTests` 25, `PacingTests` 5 e 
 - [ ] **Step 6: Rodar tudo, commit e push**
 
 Run: `dotnet build host/ScreenShare.slnx` e `dotnet test host/ScreenShare.slnx`
-Expected: 0 avisos; 324 aprovados e 1 ignorado.
+Expected: 0 avisos; 326 aprovados e 1 ignorado.
 
 ```bash
 git add host/ScreenShare.Video host/ScreenShare.Tests/Video
@@ -6017,7 +6060,7 @@ Expected: 9 aprovados. O monitor principal é capturado no tamanho dele em menos
 - [ ] **Step 5: Rodar tudo, commit e push**
 
 Run: `dotnet build host/ScreenShare.slnx` e `dotnet test host/ScreenShare.slnx`
-Expected: 0 avisos; 331 aprovados e 3 ignorados.
+Expected: 0 avisos; 333 aprovados e 3 ignorados.
 
 ```bash
 git add host/ScreenShare.Video host/ScreenShare.Tests/Video
@@ -6813,7 +6856,7 @@ Se o teste dos 600 quadros falhar (aparecer um IDR sozinho), o encoder não acei
 - [ ] **Step 6: Rodar tudo, commit e push**
 
 Run: `dotnet build host/ScreenShare.slnx` e `dotnet test host/ScreenShare.slnx`
-Expected: 0 avisos; 331 aprovados e 7 ignorados.
+Expected: 0 avisos; 333 aprovados e 7 ignorados.
 
 ```bash
 git add host/ScreenShare.Video host/ScreenShare.Tests/Video
@@ -7268,17 +7311,39 @@ Em `host/ScreenShare.DevHost/HostServer.cs`:
 -        var reading = ReadLoopAsync(reader, writer, video, session.Token);
 +        var reading = ReadLoopAsync(reader, writer, video, stats, session.Token);
          _ = PingAsync(writer, session.Token);
-         try
-         {
-@@ -195,6 +203,7 @@ public sealed class HostServer : IDisposable
-                 var started = await StartVideoAsync(new VideoRequest(lease, hello.SupportedCodecs, link), new WriterOutput(writer), session.Token);
-                 video.Start(started);
-                 if (started is null) writer.SendFallbackConfig(fallback);
-+                else _ = LogStatsAsync(started, stats, session.Token);
+         // A abertura do vídeo tem cancelamento próprio: se o celular sair enquanto ela demora, ela é cancelada antes de
+         // o vídeo ser encerrado, e o escritor só para depois.
+@@ -196,7 +204,8 @@ public sealed class HostServer : IDisposable
+             else
+             {
+                 _ = SendFallbackLaterAsync(writer, fallback, session.Token);
+-                starting = AttachVideoAsync(new VideoRequest(lease, hello.SupportedCodecs, link), writer, video, fallback, opening.Token);
++                starting = AttachVideoAsync(new VideoRequest(lease, hello.SupportedCodecs, link), writer, video, fallback, stats,
++                    opening.Token);
              }
-             // O que terminar primeiro encerra a sessão: o cliente (fim, prazo, protocolo) ou o escritor (rede).
-             await await Task.WhenAny(reading, writing);
-@@ -222,8 +231,9 @@ public sealed class HostServer : IDisposable
+             // O que terminar primeiro encerra a sessão: o cliente (fim, prazo, protocolo) ou o escritor (rede). A abertura
+             // do vídeo terminar não encerra nada; a sessão segue esperando os outros dois.
+@@ -219,13 +228,17 @@ public sealed class HostServer : IDisposable
+         }
+     }
+ 
+-    /// <summary>Abre o vídeo e o liga à sessão; sem vídeo (falha ou sem encoder), o celular recebe o CONFIG de fallback.</summary>
++    /// <summary>
++    /// Abre o vídeo e o liga à sessão, com as estatísticas no console; sem vídeo (falha ou sem encoder), o celular recebe
++    /// o CONFIG de fallback.
++    /// </summary>
+     private async Task AttachVideoAsync(VideoRequest request, SessionWriter writer, SessionVideo video, ConfigMessage fallback,
+-        CancellationToken cancellationToken)
++        SessionStats stats, CancellationToken cancellationToken)
+     {
+         var started = await StartVideoAsync(request, new WriterOutput(writer), cancellationToken);
+         video.Start(started);
+         if (started is null) writer.SendFallbackConfig(fallback);
++        else _ = LogStatsAsync(started, stats, cancellationToken);
+     }
+ 
+     /// <summary>Começa o vídeo da sessão; uma falha vira sessão sem vídeo (o celular recebe o CONFIG de fallback).</summary>
+@@ -242,8 +255,9 @@ public sealed class HostServer : IDisposable
          }
      }
  
@@ -7290,7 +7355,7 @@ Em `host/ScreenShare.DevHost/HostServer.cs`:
      {
          while (await ReadWithIdleDeadlineAsync(reader, cancellationToken) is { } message)
          {
-@@ -235,7 +245,10 @@ public sealed class HostServer : IDisposable
+@@ -255,7 +269,10 @@ public sealed class HostServer : IDisposable
                  case KeyframeRequestMessage:
                      video.RequestKeyframe();
                      break;
@@ -7302,7 +7367,7 @@ Em `host/ScreenShare.DevHost/HostServer.cs`:
              }
          }
      }
-@@ -272,6 +285,30 @@ public sealed class HostServer : IDisposable
+@@ -292,6 +309,30 @@ public sealed class HostServer : IDisposable
          }
      }
  
@@ -7333,7 +7398,7 @@ Em `host/ScreenShare.DevHost/HostServer.cs`:
      /// <summary>Chamado pelo laço de leitura e pelo escritor (thread do encoder): nunca lança.</summary>
      private void RequestKeyframe(IVideoStream video)
      {
-@@ -352,6 +389,24 @@ public sealed class HostServer : IDisposable
+@@ -372,6 +413,24 @@ public sealed class HostServer : IDisposable
          }
      }
  
@@ -7434,7 +7499,7 @@ Em `host/ScreenShare.DevHost/Program.cs`:
 - [ ] **Step 5: Rodar tudo, commit e push**
 
 Run: `dotnet build host/ScreenShare.slnx` e `dotnet test host/ScreenShare.slnx`
-Expected: 0 avisos; 346 aprovados e 7 ignorados.
+Expected: 0 avisos; 348 aprovados e 7 ignorados.
 
 ```bash
 git add host/ScreenShare.DevHost host/ScreenShare.Video host/ScreenShare.Tests
@@ -10304,12 +10369,12 @@ internal sealed class DesktopDuplicationCapture : IScreenCapture
 ```
 
 Run (PowerShell, no PC do usuário): `$env:SCREENSHARE_GPU_TESTS=1; dotnet test host/ScreenShare.slnx; Remove-Item Env:SCREENSHARE_GPU_TESTS`
-Expected: 357 aprovados e 1 ignorado (o teste do driver de monitor virtual).
+Expected: 359 aprovados e 1 ignorado (o teste do driver de monitor virtual).
 
 - [ ] **Step 4: Rodar tudo, commit e push**
 
 Run: `dotnet build host/ScreenShare.slnx` e `dotnet test host/ScreenShare.slnx`
-Expected: 0 avisos; 351 aprovados e 7 ignorados.
+Expected: 0 avisos; 353 aprovados e 7 ignorados.
 
 ```bash
 git add host/ScreenShare.Video host/ScreenShare.Tests/Video
@@ -10376,7 +10441,7 @@ Mantenha o tom e o formato do README atual (pt-BR, emojis nos títulos que já e
 Em `docs/guia-do-codigo.md`:
 - uma seção para o projeto `host/ScreenShare.Video`, com uma linha por arquivo de `Pipeline/` e de `Hardware/` dizendo o que faz;
 - as linhas dos arquivos novos e alterados do Core (`Video/AnnexB.cs`, `Video/PcClock.cs`, `Protocol/VideoSendQueue.cs`, `Protocol/SessionWriter.cs`), do DevHost (`DevHostOptions.cs`, `VideoStatsLine.cs`, `HostServer.cs`) e do app (`video/*.kt`, `net/Connection.kt`, `ui/ImmersiveScreen.kt`);
-- as contagens de testes: 351 aprovados e 7 ignorados no host sem GPU, 357 e 1 com GPU, e 116 no app.
+- as contagens de testes: 353 aprovados e 7 ignorados no host sem GPU, 359 e 1 com GPU, e 116 no app.
 
 Siga o formato de tabela "Arquivo | O que faz" que o guia já usa.
 
