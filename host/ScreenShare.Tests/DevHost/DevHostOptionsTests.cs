@@ -54,6 +54,7 @@ public sealed class DevHostOptionsTests
     public void Option_without_its_value_is_rejected()
     {
         Assert.Throws<OptionsException>(() => DevHostOptions.Parse(["--gravar"]));
+        Assert.Throws<OptionsException>(() => DevHostOptions.Parse(["--gravar", "--fps", "30"]));
     }
 
     [Fact]

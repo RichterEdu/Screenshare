@@ -19,7 +19,16 @@ public sealed class RecordingVideoSource(IVideoSource inner, string path, Action
     public async Task<IVideoStream?> StartAsync(VideoRequest request, IVideoOutput output, CancellationToken cancellationToken)
     {
         var recorder = new RecordingOutput(output, path, log);
-        var stream = await inner.StartAsync(request, recorder, cancellationToken);
+        IVideoStream? stream;
+        try
+        {
+            stream = await inner.StartAsync(request, recorder, cancellationToken);
+        }
+        catch
+        {
+            recorder.Close(); // o arquivo não pode ficar aberto: a próxima sessão grava nele de novo
+            throw;
+        }
         if (stream is null)
         {
             recorder.Close();
@@ -46,7 +55,7 @@ public sealed class RecordingVideoSource(IVideoSource inner, string path, Action
                 {
                     _file?.Write(frame.Data);
                 }
-                catch (IOException e)
+                catch (Exception e) when (e is IOException or UnauthorizedAccessException)
                 {
                     log($"Gravação interrompida: {e.Message}");
                     _file?.Dispose();
@@ -74,8 +83,14 @@ public sealed class RecordingVideoSource(IVideoSource inner, string path, Action
 
         public async ValueTask DisposeAsync()
         {
-            await inner.DisposeAsync();
-            recorder.Close();
+            try
+            {
+                await inner.DisposeAsync();
+            }
+            finally
+            {
+                recorder.Close();
+            }
         }
     }
 }

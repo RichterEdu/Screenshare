@@ -63,7 +63,8 @@ public sealed record DevHostOptions(bool NoMonitor, bool NoVideo, bool CapturePr
 
     private static string Value(IReadOnlyList<string> args, ref int i, string option)
     {
-        if (i + 1 >= args.Count) throw new OptionsException($"{option} precisa de um valor.");
+        if (i + 1 >= args.Count || args[i + 1].StartsWith("--", StringComparison.Ordinal))
+            throw new OptionsException($"{option} precisa de um valor.");
         return args[++i];
     }
 

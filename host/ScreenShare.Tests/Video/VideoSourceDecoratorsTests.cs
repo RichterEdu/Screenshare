@@ -45,6 +45,24 @@ public sealed class VideoSourceDecoratorsTests : IDisposable
         Assert.Equal(3, output.Sent.Count);
     }
 
+    [Fact]
+    public async Task Recording_file_is_closed_when_the_video_fails_to_start()
+    {
+        var path = Path.Combine(_dir, "video.h265");
+        var source = new RecordingVideoSource(new FailingSource(), path, _ => { });
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            source.StartAsync(Request(), new FakeOutput(), CancellationToken.None));
+
+        File.Delete(path); // aberto ainda, isto falharia no Windows
+    }
+
+    private sealed class FailingSource : IVideoSource
+    {
+        public Task<IVideoStream?> StartAsync(VideoRequest request, IVideoOutput output, CancellationToken cancellationToken) =>
+            throw new InvalidOperationException("falha falsa ao abrir");
+    }
+
     private sealed class CapturingSource : IVideoSource
     {
         public VideoRequest? Request { get; private set; }
