@@ -67,6 +67,12 @@ internal sealed class FakeEncoder(EncoderSettings settings) : IVideoEncoder
     /// <summary>Simula um encoder cuja primeira saída não é IDR.</summary>
     public bool FirstOutputIsP { get; set; }
 
+    /// <summary>Quantos pedidos de IDR o encoder ainda vai ignorar (sai P-frame no lugar).</summary>
+    public int IgnoreForce { get; set; }
+
+    /// <summary>Simula um encoder que abre mas recusa todo quadro.</summary>
+    public bool ThrowOnSubmit { get; set; }
+
     public List<(ulong Timestamp, bool Forced)> Submitted { get; } = [];
     public bool Disposed { get; private set; }
 
@@ -78,7 +84,13 @@ internal sealed class FakeEncoder(EncoderSettings settings) : IVideoEncoder
     public void Submit(IVideoImage image, ulong timestampUs, bool forceKeyframe)
     {
         Submitted.Add((timestampUs, forceKeyframe));
+        if (ThrowOnSubmit) throw new InvalidOperationException("quadro recusado (falso)");
         var key = forceKeyframe && !(FirstOutputIsP && Submitted.Count == 1);
+        if (key && IgnoreForce > 0)
+        {
+            IgnoreForce--;
+            key = false;
+        }
         byte[] p = Codec == VideoCodec.H265 ? [0, 0, 0, 1, 0x02, 0x01, 0xD0] : [0, 0, 0, 1, 0x41, 0x9A];
         Output?.Invoke(new EncodedFrame(timestampUs, key, key ? Idr(Codec) : p));
     }

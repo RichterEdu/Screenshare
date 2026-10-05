@@ -41,6 +41,8 @@ public sealed class PipelineVideoSource : IVideoSource
 
     private sealed class PipelineStream : IVideoStream
     {
+        private static readonly TimeSpan StopTimeout = TimeSpan.FromSeconds(5);
+
         private readonly PipelineVideoSource _owner;
         private readonly VideoPipeline _pipeline;
         private readonly AutoResetEvent _wake = new(false);
@@ -60,11 +62,22 @@ public sealed class PipelineVideoSource : IVideoSource
 
         public void RequestKeyframe() => _pipeline.RequestKeyframe();
 
+        /// <summary>
+        /// Para a thread e espera ela soltar a captura e o encoder, por até 5 s: um driver travado não pode prender o fim
+        /// da sessão (nem a próxima sessão, que espera esta sair do vídeo).
+        /// </summary>
         public async ValueTask DisposeAsync()
         {
             _stopping = true;
-            _wake.Set();
-            await _stopped.Task;
+            _wake.Set(); // o evento nunca é descartado: um pedido de keyframe atrasado não pode lançar
+            try
+            {
+                await _stopped.Task.WaitAsync(StopTimeout);
+            }
+            catch (TimeoutException)
+            {
+                _owner._log($"O vídeo não parou em {StopTimeout.TotalSeconds:0} s; a sessão segue sem esperar.");
+            }
         }
 
         private void Run()

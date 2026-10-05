@@ -280,7 +280,7 @@ public sealed class VideoPipelineTests : IDisposable
         Run(pipeline, 5 * Ms);
 
         _backend.Encoders[0].Fail(new InvalidOperationException("falhou"));
-        Run(pipeline, 30 * Ms);
+        Run(pipeline, 150 * Ms); // recria depois da espera de 100 ms
 
         Assert.True(_backend.Encoders[0].Disposed);
         Assert.Equal(2, _output.Configs.Count);
@@ -294,7 +294,7 @@ public sealed class VideoPipelineTests : IDisposable
         Run(pipeline, 5 * Ms);
         var old = _backend.Encoders[0];
         old.Fail(new InvalidOperationException("falhou"));
-        Run(pipeline, 30 * Ms);
+        Run(pipeline, 150 * Ms);
         var count = _output.Sent.Count;
 
         old.Emit(new EncodedFrame(99, true, FakeEncoder.Idr(VideoCodec.H265)));
@@ -314,6 +314,108 @@ public sealed class VideoPipelineTests : IDisposable
         Assert.True(_backend.Disposed);
         Assert.Equal(2, _backendsCreated);
         Assert.Equal(2, _output.Configs.Count);
+    }
+
+    [Fact]
+    public void Encoder_that_rejects_every_frame_backs_off_and_its_codec_gives_way()
+    {
+        _backend.EncoderSetup = encoder => encoder.ThrowOnSubmit = encoder.Codec == VideoCodec.H265;
+        var health = new CodecHealth();
+        var pipeline = Create(health: health);
+
+        Run(pipeline, TimeSpan.FromSeconds(2));
+
+        Assert.Equal(VideoPipeline.MaxFailuresWithoutOutput, _backend.Encoders.Count(e => e.Codec == VideoCodec.H265));
+        Assert.Equal(VideoCodec.H265, health.Failed);
+        Assert.Equal(VideoCodec.H264, Assert.Single(_output.Configs).Codec);
+        Assert.True(_log.Count < 10, $"{_log.Count} linhas de log");
+    }
+
+    [Fact]
+    public void Codec_that_worked_and_then_fails_to_reopen_recreates_everything_and_is_kept()
+    {
+        var health = new CodecHealth();
+        var pipeline = Create(health: health);
+        Run(pipeline, 50 * Ms);
+
+        // A placa reiniciou: o encoder avisa erro e nenhum encoder abre enquanto ela volta.
+        _backend.FailingCodecs = VideoCodec.H264 | VideoCodec.H265;
+        _backend.Encoders[0].Fail(new InvalidOperationException("erro do encoder"));
+        Run(pipeline, 500 * Ms);
+        _backend.FailingCodecs = VideoCodec.None;
+        Run(pipeline, TimeSpan.FromSeconds(3));
+
+        Assert.Equal(VideoCodec.None, health.Failed);
+        Assert.True(_backendsCreated >= 2, "o backend não foi recriado");
+        Assert.Equal(2, _output.Configs.Count);
+        Assert.Equal(VideoCodec.H265, _output.Configs[1].Codec);
+    }
+
+    [Fact]
+    public void Encoder_reporting_a_lost_device_recreates_the_backend()
+    {
+        var pipeline = Create();
+        Run(pipeline, 5 * Ms);
+
+        _backend.Encoders[0].Fail(new DeviceLostException("DEVICE_REMOVED"));
+        Run(pipeline, 150 * Ms);
+
+        Assert.True(_backend.Disposed);
+        Assert.Equal(2, _backendsCreated);
+        Assert.Equal(2, _output.Configs.Count);
+    }
+
+    [Fact]
+    public void Requested_idr_that_comes_out_as_a_p_frame_is_requested_again()
+    {
+        var pipeline = Create();
+        Run(pipeline, 300 * Ms);
+        _backend.Encoders[0].IgnoreForce = 1;
+
+        pipeline.RequestKeyframe();
+        Run(pipeline, 500 * Ms);
+
+        Assert.Equal(2, _output.Frames.Count(f => f.IsKeyframe)); // o do começo e o pedido de novo
+    }
+
+    [Fact]
+    public void Encoder_that_stops_asking_for_input_is_recreated_after_a_second()
+    {
+        var pipeline = Create();
+        Run(pipeline, 5 * Ms);
+
+        _backend.Encoders[0].CanAccept = false;
+        Run(pipeline, TimeSpan.FromMilliseconds(1200));
+
+        Assert.True(_backend.Encoders[0].Disposed);
+        Assert.Equal(2, _output.Configs.Count);
+    }
+
+    [Fact]
+    public void Unexpected_error_restarts_the_video_instead_of_stopping_it()
+    {
+        var pipeline = Create();
+        Run(pipeline, 5 * Ms);
+
+        _backend.Captures[0].ThrowOnAcquire = new InvalidOperationException("erro inesperado do driver");
+        Run(pipeline, 150 * Ms);
+
+        Assert.Equal(2, _backendsCreated);
+        Assert.Equal(2, _output.Configs.Count);
+    }
+
+    [Fact]
+    public void Monitor_change_does_not_wait_for_a_pending_backoff()
+    {
+        for (var i = 0; i < 3; i++) _backend.OpenFailures.Enqueue(new CaptureLostException("E_ACCESSDENIED"));
+        var pipeline = Create();
+        Run(pipeline, 320 * Ms); // tentativas em 0, 100 e 300 ms; a próxima seria em 700
+        Assert.Equal(3, _backend.Opened.Count);
+
+        _monitor.Change(Display5 with { DeviceName = @"\\.\DISPLAY6" });
+        Run(pipeline, 5 * Ms);
+
+        Assert.Equal(4, _backend.Opened.Count);
     }
 
     [Fact]

@@ -12,6 +12,9 @@ namespace ScreenShare.Video.Pipeline;
 /// - Só captura com o ritmo de fps permitindo, o encoder pedindo entrada e nenhum quadro esperando a rede: assim a
 ///   captura junta as mudanças enquanto a rede está ocupada, e o quadro seguinte já é a imagem mais nova.
 /// - Tela parada: refinamentos em +100, +300 e +700 ms e, se pedido, IDR da última imagem.
+/// - Falhas: encoder que quebra é recriado com espera crescente; um codec que nunca funcionou é deixado de lado depois
+///   de 3 falhas seguidas; um codec que já funcionou e não abre mais indica a placa reiniciada (recria tudo); qualquer
+///   erro inesperado recomeça o vídeo em vez de pará-lo.
 /// </summary>
 public sealed class VideoPipeline : IDisposable
 {
@@ -24,11 +27,17 @@ public sealed class VideoPipeline : IDisposable
     /// <summary>Quanto o Step pede para esperar quando a rede ou o encoder ainda não liberaram.</summary>
     public static readonly TimeSpan BusyWait = TimeSpan.FromMilliseconds(1);
 
+    /// <summary>O encoder sem pedir entrada por mais que isto está travado: é recriado.</summary>
+    public static readonly TimeSpan EncoderStallTimeout = TimeSpan.FromSeconds(1);
+
     /// <summary>Recodificações da última imagem depois que a tela para (o controle de bitrate deixa o primeiro quadro borrado).</summary>
     public static readonly TimeSpan[] Refinements =
         [TimeSpan.FromMilliseconds(100), TimeSpan.FromMilliseconds(300), TimeSpan.FromMilliseconds(700)];
 
-    private const int MaxTrackedSubmits = 1000;
+    /// <summary>Falhas seguidas, sem nenhum quadro saindo, para desistir de um codec que nunca funcionou nesta execução.</summary>
+    public const int MaxFailuresWithoutOutput = 3;
+
+    private const int MaxTracked = 1000;
 
     private readonly Lock _gate = new();
     private readonly Func<IVideoBackend> _createBackend;
@@ -55,14 +64,20 @@ public sealed class VideoPipeline : IDisposable
     private TimeSpan? _lastChange;
     private int _refinementsDone;
     private string? _lastProblem;
+    private int _failuresWithoutOutput;
+    private TimeSpan? _busySince;
 
     // Compartilhados com a thread do encoder e com a sessão: sob _gate.
     private readonly Dictionary<ulong, long> _submittedAt = [];
+    private readonly HashSet<ulong> _forced = [];
     private readonly RecentDurations _encodeTimes = new(300);
     private IVideoEncoder? _encoder;
     private int _generation;
     private bool _needConfig;
-    private bool _encoderFailed;
+    private int _failedGeneration = -1;
+    private Exception? _failure;
+    private bool _deviceLost;
+    private bool _outputSeen;
     private bool _monitorChanged;
     private ulong _lastTimestamp;
     private long _frames;
@@ -116,12 +131,29 @@ public sealed class VideoPipeline : IDisposable
     /// <summary>Um passo. Devolve quanto esperar antes do próximo (zero = chamar de novo já).</summary>
     public TimeSpan Step()
     {
+        bool monitorChanged, outputSeen, deviceLost;
         lock (_gate)
         {
             if (_disposed) return MaxRetry;
+            monitorChanged = _monitorChanged;
+            outputSeen = _outputSeen;
+            deviceLost = _deviceLost;
+            _outputSeen = false;
+            _deviceLost = false;
+        }
+        if (outputSeen)
+        {
+            _retryDelay = FirstRetry; // o vídeo voltou a sair: a próxima falha recomeça a espera do zero
+            _failuresWithoutOutput = 0;
         }
         var now = Now;
-        if (now < _retryAt) return _retryAt - now;
+        if (deviceLost)
+        {
+            Problem("A placa de vídeo foi reiniciada (o encoder avisou); recriando a captura e o encoder.");
+            CloseAll();
+            return Backoff(now);
+        }
+        if (now < _retryAt && !monitorChanged) return _retryAt - now; // monitor novo não espera a espera acabar
 
         try
         {
@@ -137,6 +169,13 @@ public sealed class VideoPipeline : IDisposable
         catch (DeviceLostException e)
         {
             Problem($"A placa de vídeo foi reiniciada ({e.Message}); recriando a captura e o encoder.");
+            CloseAll();
+            return Backoff(now);
+        }
+        catch (Exception e)
+        {
+            // Erro que ninguém previu (driver, interop): recomeça tudo em vez de deixar a sessão com a imagem congelada.
+            Problem($"Falha inesperada no vídeo ({e.Message}); recomeçando a captura e o encoder.");
             CloseAll();
             return Backoff(now);
         }
@@ -211,13 +250,18 @@ public sealed class VideoPipeline : IDisposable
 
     private bool EnsureEncoder()
     {
-        bool failed;
+        Exception? failure;
         lock (_gate)
         {
-            failed = _encoderFailed;
-            _encoderFailed = false;
+            failure = _failedGeneration == _generation ? _failure : null;
+            _failedGeneration = -1;
+            _failure = null;
         }
-        if (failed) CloseEncoder();
+        if (failure is not null && _encoder is not null)
+        {
+            EncoderBroke($"O encoder falhou ({failure.Message}); recriando.");
+            return false;
+        }
 
         var capture = _capture!;
         if (_encoder is { } current && current.Width == capture.Width && current.Height == capture.Height) return true;
@@ -239,10 +283,32 @@ public sealed class VideoPipeline : IDisposable
             }
             catch (EncoderUnavailableException e)
             {
+                if (_health.HasWorked(codec))
+                {
+                    // Já funcionou nesta execução: a placa reiniciou ou a falha é passageira. Recria tudo e tenta de novo.
+                    Problem($"Encoder {CodecChooser.Name(codec)} não abriu ({e.Message}); recriando a captura e o encoder.");
+                    CloseAll();
+                    return false;
+                }
                 _log($"Encoder {CodecChooser.Name(codec)} indisponível ({e.Message}); ele fica de fora até o host reiniciar.");
                 _health.MarkFailed(codec);
             }
         }
+    }
+
+    /// <summary>
+    /// O encoder em uso quebrou: fecha (o próximo Step espera e recria). Um codec que nunca produziu vídeo nesta execução
+    /// é deixado de lado depois de MaxFailuresWithoutOutput falhas seguidas, e o outro codec assume.
+    /// </summary>
+    private void EncoderBroke(string message)
+    {
+        var codec = _encoder?.Codec ?? VideoCodec.None;
+        Problem(message);
+        CloseEncoder();
+        if (++_failuresWithoutOutput < MaxFailuresWithoutOutput || codec == VideoCodec.None || _health.HasWorked(codec)) return;
+        _log($"Encoder {CodecChooser.Name(codec)} falhou {_failuresWithoutOutput} vezes sem produzir vídeo; ele fica de fora até o host reiniciar.");
+        _health.MarkFailed(codec);
+        _failuresWithoutOutput = 0;
     }
 
     private void StartStream(IVideoEncoder encoder)
@@ -255,7 +321,9 @@ public sealed class VideoPipeline : IDisposable
             _encoder = encoder;
             _needConfig = true;
             _submittedAt.Clear();
+            _forced.Clear();
         }
+        _busySince = null;
         _keyframes.RequestNow();
         _log($"Vídeo: {CodecChooser.Name(encoder.Codec)} {encoder.Width}×{encoder.Height}, até {_options.Fps} fps, {_bitrateKbps / 1000} Mbps.");
     }
@@ -264,7 +332,20 @@ public sealed class VideoPipeline : IDisposable
     {
         var capture = _capture!;
         var encoder = _encoder!;
-        if (_output.PendingFrames > 0 || !encoder.CanAccept) return BusyWait;
+        if (_output.PendingFrames > 0)
+        {
+            _busySince = null; // esperando a rede, não o encoder
+            return BusyWait;
+        }
+        if (!encoder.CanAccept)
+        {
+            _busySince ??= now;
+            if (now - _busySince.Value < EncoderStallTimeout) return BusyWait;
+            _busySince = null;
+            EncoderBroke("O encoder parou de pedir quadros; recriando.");
+            return Backoff(now);
+        }
+        _busySince = null;
         var pace = _pacer.Delay(now);
         if (pace > TimeSpan.Zero) return pace;
 
@@ -272,55 +353,66 @@ public sealed class VideoPipeline : IDisposable
         var refinementDue = _haveImage && RefinementDue(now);
         var result = capture.TryAcquire(keyframeDue || refinementDue ? TimeSpan.Zero : AcquireTimeout, out var presentUs);
         now = Now; // a espera do TryAcquire conta
+        var submitted = true;
         if (result == AcquireResult.NewImage)
         {
             _haveImage = true;
             _lastChange = now;
             _refinementsDone = 0;
-            Submit(encoder, capture.Last, presentUs, now);
+            submitted = Submit(encoder, capture.Last, presentUs, now);
         }
         else if (keyframeDue || refinementDue)
         {
             if (refinementDue) _refinementsDone++;
-            Submit(encoder, capture.Last, 0, now);
+            submitted = Submit(encoder, capture.Last, 0, now);
         }
-        return TimeSpan.Zero;
+        return submitted ? TimeSpan.Zero : Backoff(now);
     }
 
     private bool RefinementDue(TimeSpan now) =>
         _lastChange is { } changed && _refinementsDone < Refinements.Length && now - changed >= Refinements[_refinementsDone];
 
-    private void Submit(IVideoEncoder encoder, IVideoImage image, ulong presentUs, TimeSpan now)
+    /// <summary>Manda a imagem ao encoder. false = o encoder recusou e foi fechado (o Step espera antes de recriar).</summary>
+    private bool Submit(IVideoEncoder encoder, IVideoImage image, ulong presentUs, TimeSpan now)
     {
         var timestamp = presentUs != 0 ? presentUs : _clockUs();
+        var force = _keyframes.TakeDue(now);
         lock (_gate)
         {
             if (timestamp <= _lastTimestamp) timestamp = _lastTimestamp + 1; // estritamente crescente dentro do stream
             _lastTimestamp = timestamp;
-            if (_submittedAt.Count >= MaxTrackedSubmits) _submittedAt.Clear();
+            if (_submittedAt.Count >= MaxTracked) _submittedAt.Clear();
             _submittedAt[timestamp] = _time.GetTimestamp();
+            if (force)
+            {
+                if (_forced.Count >= MaxTracked) _forced.Clear();
+                _forced.Add(timestamp);
+            }
         }
-        var force = _keyframes.TakeDue(now);
         _pacer.MarkSent(now);
         _lastProblem = null;
         try
         {
             encoder.Submit(image, timestamp, force);
+            return true;
         }
         catch (Exception e) when (e is not DeviceLostException)
         {
-            _log($"O encoder recusou o quadro ({e.Message}); recriando.");
-            CloseEncoder();
+            if (force) _keyframes.RequestNow(); // o IDR pedido não saiu: vai no próximo encoder
+            EncoderBroke($"O encoder recusou o quadro ({e.Message}); recriando.");
+            return false;
         }
     }
 
     /// <summary>Saída do encoder, na thread dele. A emissão fica sob a trava para um stream novo nunca se misturar ao antigo.</summary>
     private void OnOutput(int generation, EncodedFrame frame)
     {
+        var askAgain = false;
         lock (_gate)
         {
             if (_disposed || generation != _generation) return; // encoder antigo: o stream dele acabou
             if (_submittedAt.Remove(frame.TimestampUs, out var submitted)) _encodeTimes.Add(_time.GetElapsedTime(submitted));
+            var forced = _forced.Remove(frame.TimestampUs);
             if (_needConfig)
             {
                 if (!frame.IsKeyframe)
@@ -333,11 +425,21 @@ public sealed class VideoPipeline : IDisposable
                     (uint)_bitrateKbps, AnnexB.ExtractParameterSets(frame.Data, encoder.Codec) ?? []));
                 _needConfig = false;
             }
+            else if (forced && !frame.IsKeyframe)
+            {
+                // O IDR pedido saiu como P-frame (alguns encoders aplicam o pedido no quadro seguinte): pede de novo, senão a
+                // fila de envio, que espera um keyframe depois de um descarte, ficaria descartando tudo.
+                _keyframes.Request();
+                askAgain = true;
+            }
+            _health.MarkWorked(_encoder!.Codec);
+            _outputSeen = true;
             _frames++;
             _bytes += frame.Data.Length;
             if (frame.IsKeyframe) _keyframesSent++;
             _output.OnFrame(new FrameMessage(frame.TimestampUs, frame.IsKeyframe, frame.Data));
         }
+        if (askAgain) _wake?.Invoke();
     }
 
     private void OnFailed(int generation, Exception error)
@@ -345,9 +447,16 @@ public sealed class VideoPipeline : IDisposable
         lock (_gate)
         {
             if (_disposed || generation != _generation) return;
-            _encoderFailed = true;
+            if (error is DeviceLostException)
+            {
+                _deviceLost = true;
+            }
+            else
+            {
+                _failedGeneration = generation;
+                _failure = error;
+            }
         }
-        _log($"O encoder falhou ({error.Message}); recriando.");
         _wake?.Invoke();
     }
 
@@ -362,7 +471,7 @@ public sealed class VideoPipeline : IDisposable
         IVideoEncoder? encoder;
         lock (_gate)
         {
-            _generation++; // saídas atrasadas do encoder antigo passam a ser ignoradas
+            _generation++; // saídas e falhas atrasadas do encoder antigo passam a ser ignoradas
             encoder = _encoder;
             _encoder = null;
         }

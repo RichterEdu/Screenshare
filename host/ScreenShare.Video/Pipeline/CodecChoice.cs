@@ -17,20 +17,31 @@ public static class CodecChooser
     public static string Name(VideoCodec codec) => codec == VideoCodec.H265 ? "H.265" : "H.264";
 }
 
-/// <summary>Codecs cujo encoder falhou ao abrir: ficam de fora até o host reiniciar. Compartilhado entre sessões.</summary>
+/// <summary>
+/// Os codecs que já produziram vídeo nesta execução do host e os que falharam (estes ficam de fora até o host
+/// reiniciar). Um codec que já funcionou nunca é marcado como falho: a falha dele é da placa ou passageira.
+/// Compartilhado entre sessões.
+/// </summary>
 public sealed class CodecHealth
 {
     private int _failed;
+    private int _worked;
 
     public VideoCodec Failed => (VideoCodec)Volatile.Read(ref _failed);
 
-    public void MarkFailed(VideoCodec codec)
+    public void MarkFailed(VideoCodec codec) => Add(ref _failed, codec);
+
+    public void MarkWorked(VideoCodec codec) => Add(ref _worked, codec);
+
+    public bool HasWorked(VideoCodec codec) => ((VideoCodec)Volatile.Read(ref _worked) & codec) == codec;
+
+    private static void Add(ref int field, VideoCodec codec)
     {
         int seen;
         do
         {
-            seen = Volatile.Read(ref _failed);
+            seen = Volatile.Read(ref field);
         }
-        while (Interlocked.CompareExchange(ref _failed, seen | (int)codec, seen) != seen);
+        while (Interlocked.CompareExchange(ref field, seen | (int)codec, seen) != seen);
     }
 }
