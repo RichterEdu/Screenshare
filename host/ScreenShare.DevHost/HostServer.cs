@@ -61,6 +61,7 @@ public sealed class HostServer : IDisposable
         _monitors = monitors ?? NullVirtualMonitorManager.Instance;
         _video = video is null ? null : new ExclusiveVideoSource(video);
         _pingInterval = pingInterval ?? TimeSpan.FromSeconds(1);
+        ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(_pingInterval, TimeSpan.Zero, nameof(pingInterval));
         _videoConfigTimeout = videoConfigTimeout ?? TimeSpan.FromSeconds(2);
     }
 
@@ -176,40 +177,53 @@ public sealed class HostServer : IDisposable
 
         using var session = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         var writer = new SessionWriter(stream, () => PcClock.NowUs);
+        var video = new SessionVideo(this);
+        writer.KeyframeNeeded += video.RequestKeyframe; // assinado antes de o vídeo começar: nenhum descarte fica sem pedido
         var writing = writer.RunAsync(session.Token);
-        Task reading = Task.CompletedTask;
-        IVideoStream? video = null;
+        // A leitura, o PING e o prazo do fallback começam já: enquanto o vídeo abre, o celular é atendido.
+        var reading = ReadLoopAsync(reader, writer, video, session.Token);
+        _ = PingAsync(writer, session.Token);
         try
         {
-            if (_video is not null)
-                video = await _video.StartAsync(new VideoRequest(lease, hello.SupportedCodecs, link), new WriterOutput(writer), session.Token);
-            if (video is null)
+            if (_video is null)
             {
                 writer.SendFallbackConfig(fallback);
             }
             else
             {
-                var started = video;
-                writer.KeyframeNeeded += () => RequestKeyframe(started);
                 _ = SendFallbackLaterAsync(writer, fallback, session.Token);
+                var started = await StartVideoAsync(new VideoRequest(lease, hello.SupportedCodecs, link), new WriterOutput(writer), session.Token);
+                video.Start(started);
+                if (started is null) writer.SendFallbackConfig(fallback);
             }
-            _ = PingAsync(writer, session.Token);
-
-            reading = ReadLoopAsync(reader, writer, video, session.Token);
             // O que terminar primeiro encerra a sessão: o cliente (fim, prazo, protocolo) ou o escritor (rede).
             await await Task.WhenAny(reading, writing);
         }
         finally
         {
-            if (video is not null) await video.DisposeAsync();
+            await video.StopAsync(); // nunca lança: o resto do encerramento sempre acontece
             await session.CancelAsync();
             await IgnoreErrorsAsync(writing);
             await IgnoreErrorsAsync(reading);
         }
     }
 
+    /// <summary>Começa o vídeo da sessão; uma falha vira sessão sem vídeo (o celular recebe o CONFIG de fallback).</summary>
+    private async Task<IVideoStream?> StartVideoAsync(VideoRequest request, IVideoOutput output, CancellationToken cancellationToken)
+    {
+        try
+        {
+            return await _video!.StartAsync(request, output, cancellationToken);
+        }
+        catch (Exception e) when (e is not OperationCanceledException)
+        {
+            _log?.Invoke($"Vídeo indisponível nesta sessão: {e.Message}");
+            return null;
+        }
+    }
+
     /// <summary>PING → PONG, KEYFRAME_REQ → vídeo. Termina quando o cliente fecha; prazo estourado lança.</summary>
-    private async Task ReadLoopAsync(MessageReader reader, SessionWriter writer, IVideoStream? video, CancellationToken cancellationToken)
+    private async Task ReadLoopAsync(MessageReader reader, SessionWriter writer, SessionVideo video, CancellationToken cancellationToken)
     {
         while (await ReadWithIdleDeadlineAsync(reader, cancellationToken) is { } message)
         {
@@ -218,8 +232,8 @@ public sealed class HostServer : IDisposable
                 case PingMessage ping:
                     writer.Send(new PongMessage(ping.TimestampUs));
                     break;
-                case KeyframeRequestMessage when video is not null:
-                    RequestKeyframe(video);
+                case KeyframeRequestMessage:
+                    video.RequestKeyframe();
                     break;
                 // demais mensagens (PONG, TOUCH) são ignoradas: ainda não há toque
             }
@@ -281,6 +295,60 @@ public sealed class HostServer : IDisposable
         catch (Exception)
         {
             // cancelada ou já propagada pela sessão
+        }
+    }
+
+    /// <summary>
+    /// O vídeo da sessão, que começa com o laço de leitura já rodando. Um pedido de keyframe que chega antes
+    /// (KEYFRAME_REQ do celular, descarte na fila) fica guardado e vai assim que o vídeo começa. Nada aqui lança.
+    /// </summary>
+    private sealed class SessionVideo(HostServer server)
+    {
+        private readonly Lock _gate = new();
+        private IVideoStream? _stream;
+        private bool _pending;
+
+        public void Start(IVideoStream? stream)
+        {
+            bool pending;
+            lock (_gate)
+            {
+                _stream = stream;
+                pending = _pending;
+                _pending = false;
+            }
+            if (pending && stream is not null) server.RequestKeyframe(stream);
+        }
+
+        public void RequestKeyframe()
+        {
+            IVideoStream? stream;
+            lock (_gate)
+            {
+                stream = _stream;
+                if (stream is null) _pending = true;
+            }
+            if (stream is not null) server.RequestKeyframe(stream);
+        }
+
+        /// <summary>Encerra o vídeo; uma falha ao encerrar é registrada e não impede o resto do encerramento.</summary>
+        public async Task StopAsync()
+        {
+            IVideoStream? stream;
+            lock (_gate)
+            {
+                stream = _stream;
+                _stream = null;
+            }
+            if (stream is null) return;
+            try
+            {
+                await stream.DisposeAsync();
+            }
+            catch (Exception e)
+            {
+                server._log?.Invoke($"Falha ao encerrar o vídeo: {e.Message}");
+            }
         }
     }
 

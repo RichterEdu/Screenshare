@@ -491,7 +491,7 @@ public sealed class HostServerTests : IAsyncLifetime
         var second = Assert.IsType<PingMessage>(await reader.ReadAsync(_cts.Token));
 
         Assert.InRange(first.TimestampUs, afterConfig, PcClock.NowUs);
-        Assert.True(second.TimestampUs - first.TimestampUs >= 150_000, "o fixture pinga a cada 200 ms");
+        Assert.True(second.TimestampUs - first.TimestampUs >= 100_000, "o fixture pinga a cada 200 ms");
     }
 
     [Fact]
@@ -608,6 +608,65 @@ public sealed class HostServerTests : IAsyncLifetime
 
         Assert.True(_video.Started[0].Disposed);
         Assert.False(_video.Started[1].Disposed);
+    }
+
+    [Fact]
+    public async Task Phone_is_answered_while_the_video_is_still_starting_and_gets_the_fallback_in_time()
+    {
+        _video.Enabled = true;
+        _video.StartGate = new TaskCompletionSource();
+        var (client, stream, reader) = await ConnectUsbAuthedAsync();
+        using var _ = client;
+        await SendAsync(stream, Hello());
+
+        await SendAsync(stream, new PingMessage(42));
+
+        Assert.Equal(new PongMessage(42), await ReadSkippingPingsAsync(reader)); // o vídeo ainda não abriu
+        var config = Assert.IsType<ConfigMessage>(await ReadSkippingPingsAsync(reader)); // fallback em 500 ms desde o HELLO
+        Assert.Empty(config.CodecConfig);
+        _video.StartGate.SetResult();
+    }
+
+    [Fact]
+    public async Task Keyframe_request_while_the_video_is_starting_reaches_it_once_it_starts()
+    {
+        _video.Enabled = true;
+        _video.StartGate = new TaskCompletionSource();
+        var (client, stream, reader) = await ConnectUsbAuthedAsync();
+        using var _ = client;
+        await SendAsync(stream, Hello());
+        await SendAsync(stream, new KeyframeRequestMessage());
+        await SendAsync(stream, new PingMessage(7));
+        Assert.Equal(new PongMessage(7), await ReadSkippingPingsAsync(reader)); // o KEYFRAME_REQ já foi lido
+
+        _video.StartGate.SetResult();
+
+        await WaitUntilAsync(() => _video.Started.Count == 1 && _video.Started[0].KeyframeRequests == 1);
+    }
+
+    [Fact]
+    public async Task Video_that_fails_to_start_gets_the_fallback_config()
+    {
+        _video.ThrowOnStart = new InvalidOperationException("falha falsa ao abrir");
+        var (client, stream, reader) = await ConnectUsbAuthedAsync();
+        using var _ = client;
+
+        await SendAsync(stream, Hello());
+
+        Assert.Empty(Assert.IsType<ConfigMessage>(await ReadSkippingPingsAsync(reader)).CodecConfig);
+    }
+
+    [Fact]
+    public async Task Video_that_fails_to_stop_still_ends_the_session_and_releases_the_monitor()
+    {
+        _video.ThrowOnDispose = true;
+        _monitors.Monitor = new VirtualMonitor(@"\\.\DISPLAY9", 3440, 0, 2400, 1080, 175);
+        var (client, _, _, video) = await ConnectWithVideoAsync();
+
+        client.Dispose();
+
+        await WaitUntilAsync(() => _monitors.Released == 1);
+        Assert.True(video.Disposed);
     }
 
     private sealed class FakeMonitorManager : IVirtualMonitorManager

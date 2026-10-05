@@ -13,6 +13,13 @@ internal sealed class FakeVideoSource : IVideoSource
     /// <summary>Chamado quando um stream é encerrado (para conferir a ordem do encerramento).</summary>
     public Action<string>? OnEvent { get; set; }
 
+    /// <summary>Se definido, StartAsync só termina quando o teste completar (vídeo que demora a abrir).</summary>
+    public TaskCompletionSource? StartGate { get; set; }
+
+    public Exception? ThrowOnStart { get; set; }
+
+    public bool ThrowOnDispose { get; set; }
+
     public IReadOnlyList<FakeVideoStream> Started
     {
         get
@@ -21,16 +28,18 @@ internal sealed class FakeVideoSource : IVideoSource
         }
     }
 
-    public Task<IVideoStream?> StartAsync(VideoRequest request, IVideoOutput output, CancellationToken cancellationToken)
+    public async Task<IVideoStream?> StartAsync(VideoRequest request, IVideoOutput output, CancellationToken cancellationToken)
     {
-        if (!Enabled) return Task.FromResult<IVideoStream?>(null);
-        var stream = new FakeVideoStream(request, output, OnEvent);
+        if (ThrowOnStart is { } error) throw error;
+        if (!Enabled) return null;
+        var stream = new FakeVideoStream(request, output, OnEvent, ThrowOnDispose);
         lock (_started) _started.Add(stream);
-        return Task.FromResult<IVideoStream?>(stream);
+        if (StartGate is { } gate) await gate.Task.WaitAsync(cancellationToken);
+        return stream;
     }
 }
 
-internal sealed class FakeVideoStream(VideoRequest request, IVideoOutput output, Action<string>? onEvent) : IVideoStream
+internal sealed class FakeVideoStream(VideoRequest request, IVideoOutput output, Action<string>? onEvent, bool throwOnDispose) : IVideoStream
 {
     private int _keyframeRequests;
     private int _disposed;
@@ -46,6 +55,7 @@ internal sealed class FakeVideoStream(VideoRequest request, IVideoOutput output,
     public ValueTask DisposeAsync()
     {
         if (Interlocked.Exchange(ref _disposed, 1) == 0) onEvent?.Invoke("vídeo encerrado");
+        if (throwOnDispose) throw new InvalidOperationException("falha falsa ao encerrar");
         return ValueTask.CompletedTask;
     }
 }
