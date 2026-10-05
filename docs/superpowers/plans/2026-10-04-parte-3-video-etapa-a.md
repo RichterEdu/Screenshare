@@ -9098,10 +9098,16 @@ git push
   - `DecoderCore(port, requestKeyframe: () -> Unit, nowMs: () -> Long)`:
     - entradas: `onConfig`, `onFrame`, `onSurface(Boolean)`;
     - callbacks do decoder: `onInputAvailable(gen, index, capacity)`, `onOutputAvailable(gen, index)`, `onError(gen)`;
-    - controle: `release()`, `reset()`, `generation`, `isRunning`;
+    - controle: `onTick()` (o player chama a cada 100 ms: manda o pedido de keyframe que o limite adiou), `release()`, `reset()`, `generation`, `isRunning`;
   - `VideoStats(windowUs = 1_000_000)`, com `onReceived(bytes, atUs)`, `onRendered(atUs, latencyUs?)`, `snapshot(nowUs): StatsSnapshot` e `VideoStats.overlayText(StatsSnapshot, rttMs?)`;
   - `DecoderInfo(name, mime, hardware, lowLatency, sizeSupported)`;
   - `CodecSupport.choose(decoders, codec, width, height)`, `supported(decoders, width, height)`, `mimeOf(codec)`, `MIME_H264` e `MIME_H265`.
+
+**Regras da revisão desta task:**
+- um pedido de keyframe barrado pelo limite de 1 a cada 500 ms fica guardado e sai no `onTick` seguinte: com a tela do PC parada não viria outro quadro para pedir de novo, e o celular ficaria numa imagem velha;
+- um CONFIG que só muda o bitrate mantém o decoder;
+- um keyframe que chega antes da superfície já guarda os parâmetros (CONFIG vazio);
+- o HELLO anuncia só os codecs com decoder de hardware, se houver algum: o PC prefere H.265, e um H.265 só em software não aguenta 60 fps na tela inteira.
 
 **Regra do spike (E8):** o decoder preferido é o terminado em `.low_latency` (no celular de teste, `c2.qti.hevc.decoder.low_latency` e `c2.qti.avc.decoder.low_latency`). Depois vem o de hardware com `FEATURE_LowLatency`, depois o primeiro de hardware.
 
@@ -9355,6 +9361,46 @@ class DecoderCoreTest {
     }
 
     @Test
+    fun requestBlockedByTheLimitIsSentByALaterTick() {
+        val core = running()
+        core.onFrame(p(1)) // pede (t = 0)
+        now = 100
+        core.onFrame(p(2)) // barrado pelo limite; a tela do PC para e não vem mais nada
+        assertEquals(1, keyframeRequests)
+
+        now = 300
+        core.onTick()
+        assertEquals(1, keyframeRequests)
+        now = 600
+        core.onTick()
+        assertEquals(2, keyframeRequests)
+        now = 1_200
+        core.onTick()
+        assertEquals(2, keyframeRequests) // o pedido guardado sai uma vez só
+    }
+
+    @Test
+    fun configThatOnlyChangesTheBitrateKeepsTheDecoder() {
+        val core = running()
+
+        core.onConfig(config.copy(bitrateKbps = 25_000))
+
+        assertEquals(1, port.started.size)
+        assertEquals(0, port.releases)
+    }
+
+    @Test
+    fun keyframeThatArrivesBeforeTheSurfaceStartsTheDecoderWhenItAppears() {
+        core.onConfig(config.copy(codecConfig = ByteArray(0)))
+        core.onFrame(key(1)) // sem superfície ainda
+
+        core.onSurface(true)
+
+        assertEquals(1, port.started.size)
+        assertEquals(1, keyframeRequests)
+    }
+
+    @Test
     fun lostSurfaceReleasesAndItsReturnRecreatesAndAsksForAKeyframe() {
         val core = running()
 
@@ -9478,7 +9524,10 @@ class VideoStatsTest {
 
         assertEquals("c2.qti.avc.decoder.low_latency", CodecSupport.choose(decoders, VideoCodec.H264, 2520, 1080)?.name)
         assertEquals(VideoCodec.H264, CodecSupport.supported(decoders, 2520, 1080))
-        assertEquals(VideoCodec.ALL, CodecSupport.supported(decoders, 1920, 1080))
+        // H.265 só em software não entra no HELLO quando há decoder de hardware: o PC escolheria H.265
+        assertEquals(VideoCodec.H264, CodecSupport.supported(decoders, 1920, 1080))
+        // sem nenhum decoder de hardware, vale o software
+        assertEquals(VideoCodec.H265, CodecSupport.supported(decoders.filter { !it.hardware }, 1920, 1080))
     }
 }
 ```
@@ -9627,7 +9676,9 @@ interface CodecPort {
  * - superfície perdida: solta o decoder; de volta: cria e pede keyframe;
  * - erro do decoder: recria e pede keyframe;
  * - callbacks de um decoder antigo (geração anterior) são ignorados;
- * - no máximo um pedido de keyframe a cada [KEYFRAME_REQUEST_INTERVAL_MS].
+ * - no máximo um pedido de keyframe a cada [KEYFRAME_REQUEST_INTERVAL_MS]; um pedido barrado pelo limite fica guardado e
+ *   sai no [onTick] seguinte depois do intervalo (com a tela do PC parada, não viria outro quadro para pedir de novo);
+ * - CONFIG que só muda o bitrate mantém o decoder.
  */
 class DecoderCore(
     private val port: CodecPort,
@@ -9640,6 +9691,7 @@ class DecoderCore(
     private var running = false
     private var awaitingKeyframe = true
     private var lastRequestMs: Long? = null
+    private var pendingRequest = false
     private val waiting = ArrayDeque<FrameMessage>()
     private val inputs = ArrayDeque<Pair<Int, Int>>() // (índice, capacidade)
 
@@ -9650,8 +9702,9 @@ class DecoderCore(
     val isRunning: Boolean get() = running
 
     fun onConfig(config: ConfigMessage) {
-        if (config == this.config) return
+        val current = this.config
         this.config = config
+        if (current != null && sameStream(current, config)) return // só o bitrate mudou: o decoder serve
         csd = if (config.codecConfig.isEmpty()) null else CsdBuilder.build(config.codec, config.codecConfig)
         stop()
         startIfReady(askKeyframe = false) // o PC manda o IDR logo depois do CONFIG
@@ -9659,7 +9712,7 @@ class DecoderCore(
 
     fun onFrame(frame: FrameMessage) {
         val config = config ?: return
-        if (!running && hasSurface && csd == null && frame.isKeyframe) {
+        if (!running && csd == null && frame.isKeyframe) {
             csd = CsdBuilder.build(config.codec, frame.data) // CONFIG sem parâmetros: eles vêm no keyframe
             startIfReady(askKeyframe = false)
         }
@@ -9669,6 +9722,7 @@ class DecoderCore(
             return
         }
         awaitingKeyframe = false
+        pendingRequest = false
         if (frame.isKeyframe) waiting.clear() // o keyframe torna inúteis os quadros que ainda esperavam
         waiting.addLast(frame)
         if (waiting.size > MAX_WAITING) {
@@ -9680,7 +9734,17 @@ class DecoderCore(
 
     fun onSurface(available: Boolean) {
         hasSurface = available
-        if (available) startIfReady(askKeyframe = true) else stop()
+        if (!available) {
+            stop()
+            return
+        }
+        if (config != null && csd == null) askKeyframe() // sem parâmetros ainda: só um keyframe destrava o decoder
+        startIfReady(askKeyframe = true)
+    }
+
+    /** Chamado periodicamente (o player chama a cada 100 ms): manda o pedido de keyframe que o limite tinha barrado. */
+    fun onTick() {
+        if (pendingRequest) askKeyframe()
     }
 
     fun onInputAvailable(generation: Int, index: Int, capacity: Int) {
@@ -9707,6 +9771,7 @@ class DecoderCore(
         stop()
         config = null
         csd = null
+        pendingRequest = false
     }
 
     private fun feed() {
@@ -9753,10 +9818,18 @@ class DecoderCore(
     private fun askKeyframe() {
         val now = nowMs()
         val last = lastRequestMs
-        if (last != null && now - last < KEYFRAME_REQUEST_INTERVAL_MS) return
+        if (last != null && now - last < KEYFRAME_REQUEST_INTERVAL_MS) {
+            pendingRequest = true // adiado, não perdido
+            return
+        }
         lastRequestMs = now
+        pendingRequest = false
         requestKeyframe()
     }
+
+    /** O mesmo stream para o decoder: o bitrate não importa para ele. */
+    private fun sameStream(a: ConfigMessage, b: ConfigMessage) =
+        a.codec == b.codec && a.width == b.width && a.height == b.height && a.codecConfig.contentEquals(b.codecConfig)
 
     companion object {
         const val MAX_WAITING = 3
@@ -9864,8 +9937,16 @@ object CodecSupport {
             ?: candidates.firstOrNull()
     }
 
-    /** Os codecs (flags do HELLO) que algum decoder abre no tamanho da tela. */
+    /**
+     * Os codecs (flags do HELLO) que o celular decodifica no tamanho da tela. Se houver decoder de hardware para algum
+     * codec, só os de hardware entram: o PC prefere H.265, e um H.265 só em software não aguenta 60 fps na tela inteira.
+     */
     fun supported(decoders: List<DecoderInfo>, width: Int, height: Int): Int {
+        val hardware = flags(decoders.filter { it.hardware }, width, height)
+        return if (hardware != 0) hardware else flags(decoders, width, height)
+    }
+
+    private fun flags(decoders: List<DecoderInfo>, width: Int, height: Int): Int {
         var codecs = 0
         if (choose(decoders, VideoCodec.H264, width, height) != null) codecs = codecs or VideoCodec.H264
         if (choose(decoders, VideoCodec.H265, width, height) != null) codecs = codecs or VideoCodec.H265
@@ -9875,7 +9956,7 @@ object CodecSupport {
 ```
 
 Run: `.\android\gradlew.bat -p android :app:testDebugUnitTest`
-Expected: 117 testes, todos aprovados, exceto as 2 falhas conhecidas do `PairingStoreTest` (ver Task 10). São 26 novos: `AnnexBTest` 9, `DecoderCoreTest` 13 e `VideoStatsTest` 4.
+Expected: 120 testes, todos aprovados, exceto as 2 falhas conhecidas do `PairingStoreTest` (ver Task 10). São 29 novos: `AnnexBTest` 9, `DecoderCoreTest` 16 e `VideoStatsTest` 4.
 
 - [ ] **Step 3: Commit e push**
 
@@ -9908,6 +9989,7 @@ git push
 
 **Decisões:**
 - `releaseOutputBuffer(index, System.nanoTime())`: cada quadro aparece assim que é decodificado;
+- o `VideoPlayer` chama `DecoderCore.onTick()` a cada 100 ms, na thread do vídeo (pedido de keyframe adiado pelo limite);
 - a latência é medida por quadro: `renderNs/1000 − clock.toLocalUs(pts)`, pelo `setOnFrameRenderedListener`. O pts é o timestamp do PC; o `System.nanoTime` é o mesmo relógio do `nowMicros` da `Connection`;
 - app em segundo plano: a superfície some, o `detach` solta o decoder e a conexão continua (no melhor esforço). Ao voltar, o `attach` recria o decoder e pede keyframe;
 - o botão "Desconectar" virou um "Sair" discreto (60% de opacidade) no canto. O voltar do sistema também desconecta.
@@ -10118,6 +10200,18 @@ class VideoPlayer(
         nowMs = { SystemClock.elapsedRealtime() },
     )
 
+    /** A cada 100 ms: o DecoderCore manda o pedido de keyframe que o limite de 1 a cada 500 ms tinha adiado. */
+    private val tick = object : Runnable {
+        override fun run() {
+            core.onTick()
+            handler.postDelayed(this, TICK_MS)
+        }
+    }
+
+    init {
+        handler.postDelayed(tick, TICK_MS)
+    }
+
     override fun onConfig(config: ConfigMessage) {
         handler.post { core.onConfig(config) }
     }
@@ -10152,8 +10246,13 @@ class VideoPlayer(
     }
 
     fun release() {
+        handler.removeCallbacks(tick)
         handler.post { core.release() }
         thread.quitSafely()
+    }
+
+    private companion object {
+        const val TICK_MS = 100L
     }
 }
 ```
@@ -10397,7 +10496,7 @@ Em `android/app/src/main/java/dev/screenshare/android/ui/ScreenShareApp.kt`:
 - [ ] **Step 3: Compilar e testar**
 
 Run: `.\android\gradlew.bat -p android :app:assembleDebug :app:testDebugUnitTest --continue`
-Expected: o APK compila sem avisos novos do Kotlin (linhas `w:`). São 117 testes, todos aprovados, exceto as 2 falhas conhecidas do `PairingStoreTest`.
+Expected: o APK compila sem avisos novos do Kotlin (linhas `w:`). São 120 testes, todos aprovados, exceto as 2 falhas conhecidas do `PairingStoreTest`.
 
 - [ ] **Step 4: Commit e push**
 
@@ -10894,7 +10993,7 @@ Mantenha o tom e o formato do README atual (pt-BR, emojis nos títulos que já e
 Em `docs/guia-do-codigo.md`:
 - uma seção para o projeto `host/ScreenShare.Video`, com uma linha por arquivo de `Pipeline/` e de `Hardware/` dizendo o que faz;
 - as linhas dos arquivos novos e alterados do Core (`Video/AnnexB.cs`, `Video/PcClock.cs`, `Protocol/VideoSendQueue.cs`, `Protocol/SessionWriter.cs`), do DevHost (`DevHostOptions.cs`, `VideoStatsLine.cs`, `HostServer.cs`) e do app (`video/*.kt`, `net/Connection.kt`, `ui/ImmersiveScreen.kt`);
-- as contagens de testes: 361 aprovados e 9 ignorados no host sem GPU, 369 e 1 com GPU, e 117 no app.
+- as contagens de testes: 361 aprovados e 9 ignorados no host sem GPU, 369 e 1 com GPU, e 120 no app.
 
 Siga o formato de tabela "Arquivo | O que faz" que o guia já usa.
 
