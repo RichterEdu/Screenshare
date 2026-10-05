@@ -15,18 +15,54 @@ public readonly record struct MonitorRequest(int Width, int Height, int DensityD
 }
 
 /// <summary>
-/// O monitor que uma sessão está usando. Dispose libera (uma vez só); sem monitor, Width/Height são os do pedido.
+/// O monitor que a captura segue. Current muda quando o driver reinicia (o nome \\.\DISPLAYn muda) ou quando a
+/// resolução exata é aplicada; Changed avisa depois da mudança. Refresh relê a saída agora (ex.: a captura não a achou).
 /// </summary>
-public sealed class VirtualMonitorLease(MonitorRequest request, VirtualMonitor? monitor, Action? release) : IDisposable
+public interface IMonitorSource
+{
+    VirtualMonitor? Current { get; }
+
+    event Action? Changed;
+
+    VirtualMonitor? Refresh();
+}
+
+/// <summary>
+/// O monitor que uma sessão está usando. Dispose libera (uma vez só); sem monitor, Width/Height são os do pedido.
+/// O gerenciador atualiza Current e dispara Changed fora da trava dele.
+/// </summary>
+public sealed class VirtualMonitorLease(MonitorRequest request, VirtualMonitor? monitor, Action? release,
+    Func<VirtualMonitor?>? refresh = null) : IMonitorSource, IDisposable
 {
     private Action? _release = release;
+    private VirtualMonitor? _current = monitor;
 
     public static VirtualMonitorLease Without(MonitorRequest request) => new(request, null, null);
 
     public MonitorRequest Request { get; } = request;
+
+    /// <summary>O monitor no momento do Acquire.</summary>
     public VirtualMonitor? Monitor { get; } = monitor;
-    public int Width => Monitor?.Width ?? Request.Width;
-    public int Height => Monitor?.Height ?? Request.Height;
+
+    /// <summary>O monitor agora: muda depois de um reinício do driver ou da resolução exata aplicada.</summary>
+    public VirtualMonitor? Current => Volatile.Read(ref _current);
+
+    public int Width => Current?.Width ?? Request.Width;
+    public int Height => Current?.Height ?? Request.Height;
+
+    public event Action? Changed;
+
+    public VirtualMonitor? Refresh() => refresh is null ? Current : refresh();
+
+    /// <summary>Troca o monitor atual; true se mudou (quem chama dispara Changed depois, fora da trava).</summary>
+    internal bool Update(VirtualMonitor monitor)
+    {
+        if (Equals(Current, monitor)) return false;
+        Volatile.Write(ref _current, monitor);
+        return true;
+    }
+
+    internal void RaiseChanged() => Changed?.Invoke();
 
     public void Dispose() => Interlocked.Exchange(ref _release, null)?.Invoke();
 }

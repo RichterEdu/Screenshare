@@ -453,6 +453,111 @@ public sealed class VirtualMonitorManagerTests : IDisposable
         Assert.Equal((2272, 1080), (lease.Width, lease.Height));
     }
 
+    /// <summary>Reinício do driver que só acontece quando o teste manda (para assinar o Changed antes).</summary>
+    private TaskCompletionSource GatedRestartThatRenamesTo(string deviceName)
+    {
+        var go = new TaskCompletionSource();
+        _restarter = new FakeRestarter(async () =>
+        {
+            await go.Task;
+            _topology.Modes.Add((2400, 1080));
+            _topology.DeviceName = deviceName;
+            return true;
+        });
+        return go;
+    }
+
+    [Fact]
+    public async Task Driver_restart_renames_the_output_and_fires_Changed_with_the_exact_mode()
+    {
+        var go = GatedRestartThatRenamesTo(@"\\.\DISPLAY6");
+        using var manager = Create();
+        using var lease = manager.Acquire(2400, 1080, 420);
+        var changes = new List<VirtualMonitor?>();
+        lease.Changed += () => changes.Add(lease.Current);
+
+        go.SetResult();
+        await manager.PendingRestart;
+
+        var expected = new VirtualMonitor(@"\\.\DISPLAY6", 3440, 0, 2400, 1080, 175);
+        Assert.Equal([expected], changes);
+        Assert.Equal((2400, 1080), (lease.Width, lease.Height));
+        Assert.Equal(1920, lease.Monitor!.Width); // o monitor do Acquire não muda
+    }
+
+    [Fact]
+    public void Refresh_finds_the_new_name_and_fires_Changed()
+    {
+        using var manager = Create();
+        using var lease = manager.Acquire(1920, 1080, 160);
+        var changed = 0;
+        lease.Changed += () => changed++;
+        _topology.DeviceName = @"\\.\DISPLAY7"; // o driver reiniciou por fora do gerenciador
+
+        var current = lease.Refresh();
+
+        Assert.Equal(@"\\.\DISPLAY7", current!.DeviceName);
+        Assert.Equal(current, lease.Current);
+        Assert.Equal(1, changed);
+    }
+
+    [Fact]
+    public void Refresh_without_changes_does_not_fire_Changed()
+    {
+        using var manager = Create();
+        using var lease = manager.Acquire(1920, 1080, 160);
+        var changed = 0;
+        lease.Changed += () => changed++;
+
+        Assert.Equal(lease.Monitor, lease.Refresh());
+        Assert.Equal(0, changed);
+    }
+
+    [Fact]
+    public async Task Changed_handler_can_call_the_manager_without_deadlock()
+    {
+        var go = GatedRestartThatRenamesTo(@"\\.\DISPLAY6");
+        using var manager = Create();
+        using var lease = manager.Acquire(2400, 1080, 420);
+        VirtualMonitor? seen = null;
+        lease.Changed += () =>
+        {
+            seen = lease.Refresh();
+            manager.Acquire(2400, 1080, 420).Dispose();
+        };
+
+        go.SetResult();
+        await manager.PendingRestart.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.Equal(@"\\.\DISPLAY6", seen!.DeviceName);
+    }
+
+    [Fact]
+    public async Task Released_lease_is_not_updated_and_the_active_one_is()
+    {
+        var go = GatedRestartThatRenamesTo(@"\\.\DISPLAY6");
+        using var manager = Create();
+        var gone = manager.Acquire(2400, 1080, 420);
+        using var stays = manager.Acquire(2400, 1080, 420);
+        gone.Dispose();
+
+        go.SetResult();
+        await manager.PendingRestart;
+
+        Assert.Equal(@"\\.\DISPLAY5", gone.Current!.DeviceName);
+        Assert.Equal(@"\\.\DISPLAY6", stays.Current!.DeviceName);
+    }
+
+    [Fact]
+    public void Lease_without_monitor_has_no_current_and_refresh_returns_null()
+    {
+        using var lease = NullVirtualMonitorManager.Instance.Acquire(2400, 1080, 420);
+
+        Assert.Null(lease.Current);
+        Assert.Null(lease.Refresh());
+        Assert.Equal((2400, 1080), (lease.Width, lease.Height));
+    }
+
     private sealed class FakeRestarter(Func<Task<bool>> restart) : IDriverRestarter
     {
         private int _calls;

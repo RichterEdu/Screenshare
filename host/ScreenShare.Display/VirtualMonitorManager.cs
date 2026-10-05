@@ -20,6 +20,8 @@ public sealed class VirtualMonitorManager : IVirtualMonitorManager, IDisposable
     private readonly TimeProvider _time;
     private readonly Action<string> _log;
     private readonly HashSet<(int Width, int Height)> _newModesRequested = [];
+    private readonly List<VirtualMonitorLease> _active = [];
+    private readonly List<VirtualMonitorLease> _toNotify = [];
     private int _leases;
     private ITimer? _turnOff;
     private bool _disposed;
@@ -42,7 +44,18 @@ public sealed class VirtualMonitorManager : IVirtualMonitorManager, IDisposable
 
     public VirtualMonitorLease Acquire(int width, int height, int densityDpi)
     {
-        var request = MonitorRequest.Normalize(width, height, densityDpi);
+        try
+        {
+            return AcquireUnderLock(MonitorRequest.Normalize(width, height, densityDpi));
+        }
+        finally
+        {
+            NotifyChanged();
+        }
+    }
+
+    private VirtualMonitorLease AcquireUnderLock(MonitorRequest request)
+    {
         lock (_gate)
         {
             if (_disposed) return VirtualMonitorLease.Without(request);
@@ -59,9 +72,13 @@ public sealed class VirtualMonitorManager : IVirtualMonitorManager, IDisposable
                 monitor = null;
             }
             if (monitor is null) return VirtualMonitorLease.Without(request);
+            UpdateLeases(monitor); // quem já usa o monitor passa a ver o nome e o tamanho de agora
             _leases++;
             CancelTurnOff();
-            return new VirtualMonitorLease(request, monitor, Release);
+            VirtualMonitorLease? lease = null;
+            lease = new VirtualMonitorLease(request, monitor, () => Release(lease!), () => Refresh(lease!));
+            _active.Add(lease);
+            return lease;
         }
     }
 
@@ -175,6 +192,18 @@ public sealed class VirtualMonitorManager : IVirtualMonitorManager, IDisposable
 
     private async Task RestartThenApplyAsync(MonitorRequest request)
     {
+        try
+        {
+            await RestartThenApplyUnderLocksAsync(request);
+        }
+        finally
+        {
+            NotifyChanged();
+        }
+    }
+
+    private async Task RestartThenApplyUnderLocksAsync(MonitorRequest request)
+    {
         // Só começa depois que o Acquire que pediu termina de ligar o monitor (ele ainda segura a trava).
         lock (_gate)
         {
@@ -214,7 +243,10 @@ public sealed class VirtualMonitorManager : IVirtualMonitorManager, IDisposable
                         if (_leases > 0)
                         {
                             if (Apply(request, shareIfInUse: false) is { } monitor)
+                            {
                                 _log($"Monitor virtual agora em {monitor.Width}×{monitor.Height} (escala {monitor.ScalePercent}%).");
+                                UpdateLeases(monitor);
+                            }
                         }
                         else if (_turnOff is null)
                         {
@@ -249,8 +281,14 @@ public sealed class VirtualMonitorManager : IVirtualMonitorManager, IDisposable
     {
         try
         {
-            if (_leases > 0) Apply(request, shareIfInUse: true);
-            else if (_turnOff is null) TurnOff("depois de reiniciar o driver");
+            if (_leases > 0)
+            {
+                if (Apply(request, shareIfInUse: true) is { } monitor) UpdateLeases(monitor);
+            }
+            else if (_turnOff is null)
+            {
+                TurnOff("depois de reiniciar o driver");
+            }
         }
         catch (Exception e)
         {
@@ -267,10 +305,74 @@ public sealed class VirtualMonitorManager : IVirtualMonitorManager, IDisposable
         }
     }
 
-    private void Release()
+    /// <summary>
+    /// Relê a saída agora (a captura não achou o nome que tinha) e atualiza todas as sessões. Devolve o monitor atual
+    /// desta sessão.
+    /// </summary>
+    private VirtualMonitor? Refresh(VirtualMonitorLease lease)
+    {
+        try
+        {
+            lock (_gate)
+            {
+                if (_disposed || !_active.Contains(lease)) return lease.Current;
+                try
+                {
+                    if (_topology.FindVddOutput() is { Attached: true } output) UpdateLeases(Describe(output));
+                }
+                catch (Exception e)
+                {
+                    _log($"Falha ao reler o monitor virtual: {e.Message}");
+                }
+                return lease.Current;
+            }
+        }
+        finally
+        {
+            NotifyChanged();
+        }
+    }
+
+    /// <summary>Põe o monitor novo em todas as sessões e anota quais mudaram. Chamado com a trava.</summary>
+    private void UpdateLeases(VirtualMonitor monitor)
+    {
+        foreach (var lease in _active)
+        {
+            if (lease.Update(monitor) && !_toNotify.Contains(lease)) _toNotify.Add(lease);
+        }
+    }
+
+    /// <summary>
+    /// Dispara Changed nas sessões cujo monitor mudou. Sempre fora da trava: quem recebe o aviso pode chamar o
+    /// gerenciador (Refresh, Acquire) sem travar.
+    /// </summary>
+    private void NotifyChanged()
+    {
+        VirtualMonitorLease[] changed;
+        lock (_gate)
+        {
+            if (_toNotify.Count == 0) return;
+            changed = [.. _toNotify];
+            _toNotify.Clear();
+        }
+        foreach (var lease in changed)
+        {
+            try
+            {
+                lease.RaiseChanged();
+            }
+            catch (Exception e)
+            {
+                _log($"Falha ao avisar a sessão da mudança do monitor virtual: {e.Message}");
+            }
+        }
+    }
+
+    private void Release(VirtualMonitorLease lease)
     {
         lock (_gate)
         {
+            _active.Remove(lease);
             if (_disposed || --_leases > 0) return;
             CancelTurnOff();
             ITimer? timer = null;
