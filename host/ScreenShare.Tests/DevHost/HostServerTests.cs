@@ -4,8 +4,10 @@ using System.Net.Sockets;
 using System.Security.Cryptography;
 using ScreenShare.Core.Protocol;
 using ScreenShare.Core.Security;
+using ScreenShare.Core.Video;
 using ScreenShare.DevHost;
 using ScreenShare.Display;
+using ScreenShare.Video;
 
 namespace ScreenShare.Tests.DevHost;
 
@@ -17,6 +19,7 @@ public sealed class HostServerTests : IAsyncLifetime
     private readonly PairingSession _pairing = new(TimeProvider.System);
     private readonly DeviceRegistry _devices;
     private readonly FakeMonitorManager _monitors = new();
+    private readonly FakeVideoSource _video = new();
     private readonly HostServer _server;
     private Task _serving = Task.CompletedTask;
 
@@ -25,7 +28,8 @@ public sealed class HostServerTests : IAsyncLifetime
         _identity = HostIdentity.LoadOrCreate(_dir, "PC de Teste");
         _devices = new DeviceRegistry(Path.Combine(_dir, "paired-devices.json"));
         _server = new HostServer(0, 0, _identity, _pairing, _devices,
-            handshakeTimeout: TimeSpan.FromSeconds(2), idleTimeout: TimeSpan.FromSeconds(2), monitors: _monitors);
+            handshakeTimeout: TimeSpan.FromSeconds(2), idleTimeout: TimeSpan.FromSeconds(2), monitors: _monitors,
+            video: _video, pingInterval: TimeSpan.FromMilliseconds(200), videoConfigTimeout: TimeSpan.FromMilliseconds(500));
     }
 
     public Task InitializeAsync()
@@ -80,13 +84,23 @@ public sealed class HostServerTests : IAsyncLifetime
     private Task SendAsync(Stream stream, Message message) =>
         stream.WriteAsync(MessageCodec.Encode(message), _cts.Token).AsTask();
 
-    /// <summary>Depois de DENIED o PC fecha: a leitura termina (null) ou a conexão cai (IOException).</summary>
+    /// <summary>O PC fecha: a leitura termina (null) ou a conexão cai (IOException). Os PINGs do PC antes disso não contam.</summary>
     private async Task AssertClosedAsync(MessageReader reader)
     {
         Message? message = null;
-        var error = await Record.ExceptionAsync(async () => message = await reader.ReadAsync(_cts.Token));
+        var error = await Record.ExceptionAsync(async () => message = await ReadSkippingPingsAsync(reader));
         Assert.Null(message);
         Assert.True(error is null or IOException, $"erro inesperado: {error}");
+    }
+
+    /// <summary>A próxima mensagem que não seja o PING periódico do PC.</summary>
+    private async Task<Message?> ReadSkippingPingsAsync(MessageReader reader)
+    {
+        while (true)
+        {
+            var message = await reader.ReadAsync(_cts.Token);
+            if (message is not PingMessage) return message;
+        }
     }
 
     [Fact]
@@ -125,7 +139,7 @@ public sealed class HostServerTests : IAsyncLifetime
         Assert.IsType<ConfigMessage>(await reader.ReadAsync(_cts.Token));
         await SendAsync(stream, new PingMessage(123456789));
 
-        Assert.Equal(new PongMessage(123456789), await reader.ReadAsync(_cts.Token));
+        Assert.Equal(new PongMessage(123456789), await ReadSkippingPingsAsync(reader));
     }
 
     [Fact]
@@ -239,7 +253,7 @@ public sealed class HostServerTests : IAsyncLifetime
         Assert.IsType<ConfigMessage>(await reader.ReadAsync(_cts.Token));
         await SendAsync(stream, new PingMessage(42));
 
-        Assert.Equal(new PongMessage(42), await reader.ReadAsync(_cts.Token));
+        Assert.Equal(new PongMessage(42), await ReadSkippingPingsAsync(reader));
     }
 
     [Fact]
@@ -455,6 +469,147 @@ public sealed class HostServerTests : IAsyncLifetime
         Assert.Equal(1, _monitors.Acquired);
     }
 
+    /// <summary>Cabo + AUTH + HELLO com o vídeo falso ligado; devolve o stream que a sessão começou.</summary>
+    private async Task<(TcpClient Client, SslStream Stream, MessageReader Reader, FakeVideoStream Video)> ConnectWithVideoAsync()
+    {
+        _video.Enabled = true;
+        var (client, stream, reader) = await ConnectUsbAuthedAsync();
+        var before = _video.Started.Count;
+        await SendAsync(stream, Hello());
+        await WaitUntilAsync(() => _video.Started.Count == before + 1);
+        return (client, stream, reader, _video.Started[^1]);
+    }
+
+    [Fact]
+    public async Task Pc_pings_with_its_own_clock_after_the_config()
+    {
+        var (client, _, reader, _) = await ConnectWithHelloAsync();
+        using var _ = client;
+        var afterConfig = PcClock.NowUs;
+
+        var first = Assert.IsType<PingMessage>(await reader.ReadAsync(_cts.Token));
+        var second = Assert.IsType<PingMessage>(await reader.ReadAsync(_cts.Token));
+
+        Assert.InRange(first.TimestampUs, afterConfig, PcClock.NowUs);
+        Assert.True(second.TimestampUs - first.TimestampUs >= 150_000, "o fixture pinga a cada 200 ms");
+    }
+
+    [Fact]
+    public async Task Video_config_and_frames_reach_the_phone_in_order()
+    {
+        var (client, _, reader, video) = await ConnectWithVideoAsync();
+        using var _ = client;
+        var config = new ConfigMessage(2400, 1080, VideoCodec.H265, 25_000, [0, 0, 0, 1, 0x40, 0x01]);
+
+        video.Output.OnConfig(config);
+        video.Output.OnFrame(new FrameMessage(10, true, [0, 0, 0, 1, 0x26, 0x01]));
+        video.Output.OnFrame(new FrameMessage(20, false, [0, 0, 0, 1, 0x02, 0x01]));
+
+        var received = Assert.IsType<ConfigMessage>(await ReadSkippingPingsAsync(reader));
+        Assert.Equal(VideoCodec.H265, received.Codec);
+        Assert.Equal(config.CodecConfig, received.CodecConfig);
+        var key = Assert.IsType<FrameMessage>(await ReadSkippingPingsAsync(reader));
+        var p = Assert.IsType<FrameMessage>(await ReadSkippingPingsAsync(reader));
+        Assert.Equal((10UL, true), (key.TimestampUs, key.IsKeyframe));
+        Assert.Equal((20UL, false), (p.TimestampUs, p.IsKeyframe));
+    }
+
+    [Fact]
+    public async Task Video_request_carries_the_monitor_the_phone_codecs_and_the_link()
+    {
+        var monitor = new VirtualMonitor(@"\\.\DISPLAY9", 3440, 0, 2400, 1080, 175);
+        _monitors.Monitor = monitor;
+
+        var (client, _, _, video) = await ConnectWithVideoAsync();
+        using var _ = client;
+
+        Assert.Equal(monitor, video.Request.Monitor.Current);
+        Assert.Equal(VideoCodec.H264 | VideoCodec.H265, video.Request.PhoneCodecs);
+        Assert.Equal(VideoLink.Usb, video.Request.Link);
+    }
+
+    [Fact]
+    public async Task Keyframe_request_from_the_phone_reaches_the_video()
+    {
+        var (client, stream, _, video) = await ConnectWithVideoAsync();
+        using var _ = client;
+
+        await SendAsync(stream, new KeyframeRequestMessage());
+
+        await WaitUntilAsync(() => video.KeyframeRequests == 1);
+    }
+
+    [Fact]
+    public async Task Video_that_sends_nothing_gets_the_fallback_config()
+    {
+        var (client, _, reader, _) = await ConnectWithVideoAsync();
+        using var _ = client;
+
+        var config = Assert.IsType<ConfigMessage>(await ReadSkippingPingsAsync(reader)); // depois de 500 ms no fixture
+
+        Assert.Equal((2400, 1080), (config.Width, config.Height));
+        Assert.Empty(config.CodecConfig);
+    }
+
+    [Fact]
+    public async Task Phone_that_stops_reading_makes_the_queue_drop_and_ask_for_a_keyframe()
+    {
+        var (client, _, _, video) = await ConnectWithVideoAsync();
+        using var _ = client;
+        video.Output.OnConfig(new ConfigMessage(2400, 1080, VideoCodec.H264, 25_000, []));
+        var maxPending = 0;
+
+        // O celular não lê nada: os buffers do TLS e do TCP enchem e o escritor para de andar.
+        for (var i = 0; i < 300 && video.KeyframeRequests == 0; i++)
+        {
+            video.Output.OnFrame(new FrameMessage((ulong)i + 1, i == 0, new byte[1024 * 1024]));
+            maxPending = Math.Max(maxPending, video.Output.PendingFrames);
+            await Task.Delay(1, _cts.Token);
+        }
+
+        Assert.True(video.KeyframeRequests >= 1, "a fila não pediu keyframe");
+        Assert.True(maxPending <= 2, $"a fila chegou a {maxPending} quadros");
+    }
+
+    [Fact]
+    public async Task Video_stops_before_the_monitor_is_released()
+    {
+        var events = new List<string>();
+        _video.OnEvent = e =>
+        {
+            lock (events) events.Add(e);
+        };
+        _monitors.OnRelease = () =>
+        {
+            lock (events) events.Add("monitor liberado");
+        };
+        _monitors.Monitor = new VirtualMonitor(@"\\.\DISPLAY9", 3440, 0, 2400, 1080, 175);
+        var (client, _, _, _) = await ConnectWithVideoAsync();
+
+        client.Dispose();
+        await WaitUntilAsync(() => _monitors.Released == 1);
+
+        lock (events) Assert.Equal(["vídeo encerrado", "monitor liberado"], events);
+    }
+
+    [Fact]
+    public async Task New_session_takes_over_the_video()
+    {
+        _video.Enabled = true;
+        var (_, token) = _devices.Add("Pixel 8");
+        var (wifi, wifiStream, _) = await ConnectWifiAsync();
+        using var _ = wifi;
+        await SendAsync(wifiStream, new AuthMessage(token));
+        await SendAsync(wifiStream, Hello());
+        await WaitUntilAsync(() => _video.Started.Count == 1);
+
+        var (usb, _, _, _) = await ConnectWithVideoAsync();
+        using var __ = usb;
+
+        Assert.True(_video.Started[0].Disposed);
+        Assert.False(_video.Started[1].Disposed);
+    }
+
     private sealed class FakeMonitorManager : IVirtualMonitorManager
     {
         private int _acquired;
@@ -464,13 +619,17 @@ public sealed class HostServerTests : IAsyncLifetime
         public List<(int Width, int Height, int Dpi)> Requests { get; } = [];
         public int Acquired => _acquired;
         public int Released => _released;
+        public Action? OnRelease { get; set; }
 
         public VirtualMonitorLease Acquire(int width, int height, int densityDpi)
         {
             lock (Requests) Requests.Add((width, height, densityDpi));
             Interlocked.Increment(ref _acquired);
-            return new VirtualMonitorLease(MonitorRequest.Normalize(width, height, densityDpi), Monitor,
-                () => Interlocked.Increment(ref _released));
+            return new VirtualMonitorLease(MonitorRequest.Normalize(width, height, densityDpi), Monitor, () =>
+            {
+                OnRelease?.Invoke();
+                Interlocked.Increment(ref _released);
+            });
         }
     }
 }

@@ -23,6 +23,7 @@
     <ProjectReference Include="..\ScreenShare.Core\ScreenShare.Core.csproj" />
     <ProjectReference Include="..\ScreenShare.DevHost\ScreenShare.DevHost.csproj" />
     <ProjectReference Include="..\ScreenShare.Display\ScreenShare.Display.csproj" />
+    <ProjectReference Include="..\ScreenShare.Video\ScreenShare.Video.csproj" />
   </ItemGroup>
 
   <ItemGroup>

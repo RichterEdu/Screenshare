@@ -151,6 +151,33 @@ public sealed class SessionWriterTests
         Assert.True(fallback.ConfigSent);
     }
 
+    [Fact]
+    public async Task Fallback_config_goes_out_only_when_no_config_was_queued_before()
+    {
+        var fallback = Config with { CodecConfig = [] };
+        var stream = new GuardedStream();
+        var writer = new SessionWriter(stream, () => 0);
+
+        Assert.True(writer.SendFallbackConfig(fallback));
+        Assert.False(writer.SendFallbackConfig(fallback));
+        writer.SendVideoConfig(Config); // o vídeo começou depois: o CONFIG dele substitui o de fallback na fila
+        writer.SendVideoFrame(Key(1));
+        var messages = await RunUntilAsync(writer, stream, m => m.Count == 2);
+
+        Assert.Equal(Config.CodecConfig, Assert.IsType<ConfigMessage>(messages[0]).CodecConfig);
+        Assert.IsType<FrameMessage>(messages[1]);
+    }
+
+    [Fact]
+    public void Fallback_config_after_a_video_config_is_not_sent()
+    {
+        var writer = new SessionWriter(new GuardedStream(), () => 0);
+        writer.SendVideoConfig(Config);
+
+        Assert.False(writer.SendFallbackConfig(Config with { CodecConfig = [] }));
+        Assert.Equal(0, writer.PendingFrames);
+    }
+
     /// <summary>Roda o escritor até as mensagens escritas satisfazerem a condição, para e devolve tudo o que saiu.</summary>
     private static async Task<List<Message>> RunUntilAsync(SessionWriter writer, GuardedStream stream, Func<List<Message>, bool> done)
     {

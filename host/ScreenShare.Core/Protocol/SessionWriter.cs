@@ -16,6 +16,7 @@ public sealed class SessionWriter
     private readonly ConcurrentQueue<Message?> _control = new(); // null = PING carimbado na hora de escrever
     private readonly SemaphoreSlim _signal = new(0);
     private readonly byte[] _frameHeader = new byte[MessageCodec.FrameHeaderSize];
+    private readonly Lock _configGate = new();
     private volatile bool _configSent;
 
     /// <param name="clockUs">Relógio do PC em µs (PcClock.NowUs), lido quando o PING é escrito.</param>
@@ -53,11 +54,34 @@ public sealed class SessionWriter
     /// <summary>CONFIG de um stream de vídeo novo: descarta o que ainda restava do stream anterior.</summary>
     public void SendVideoConfig(ConfigMessage config)
     {
-        _configSent = true;
-        _video.EnqueueConfig(config);
+        lock (_configGate)
+        {
+            _configSent = true;
+            _video.EnqueueConfig(config);
+        }
         _signal.Release();
     }
 
+    /// <summary>
+    /// CONFIG de fallback (sem vídeo, ou vídeo que não começou a tempo): só sai se nenhum CONFIG foi posto na fila
+    /// antes. Vai pela fila de vídeo, então um CONFIG de vídeo que chegar depois o substitui. true = foi para a fila.
+    /// </summary>
+    public bool SendFallbackConfig(ConfigMessage config)
+    {
+        lock (_configGate)
+        {
+            if (_configSent) return false;
+            _configSent = true;
+            _video.EnqueueConfig(config);
+        }
+        _signal.Release();
+        return true;
+    }
+
+    /// <summary>
+    /// Um quadro de vídeo. O array passa a ser do escritor até sair: quem chama não pode reutilizá-lo nem alterá-lo.
+    /// Se a fila passar do limite, dispara KeyframeNeeded nesta mesma thread (o handler não pode lançar).
+    /// </summary>
     public void SendVideoFrame(FrameMessage frame)
     {
         switch (_video.EnqueueFrame(frame))
@@ -71,6 +95,7 @@ public sealed class SessionWriter
         }
     }
 
+    /// <summary>Escreve até o cancelamento ou um erro de rede. Uma vez por sessão (o cabeçalho do FRAME é reaproveitado).</summary>
     public async Task RunAsync(CancellationToken cancellationToken)
     {
         while (true)

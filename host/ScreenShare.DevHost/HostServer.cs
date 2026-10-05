@@ -4,14 +4,17 @@ using System.Net.Sockets;
 using System.Security.Authentication;
 using ScreenShare.Core.Protocol;
 using ScreenShare.Core.Security;
+using ScreenShare.Core.Video;
 using ScreenShare.Display;
+using ScreenShare.Video;
 
 namespace ScreenShare.DevHost;
 
 /// <summary>
-/// Servidor de desenvolvimento (sem vídeo; liga o monitor virtual por sessão). As duas portas exigem TLS e depois PAIR/AUTH antes do HELLO.
-/// A porta USB escuta só em loopback (o `adb reverse` chega por ali). Responde PING com PONG.
-/// Atende um cliente por vez em cada porta; um cliente mudo é derrubado por prazo (handshake e ociosidade).
+/// Servidor de desenvolvimento: liga o monitor virtual e o vídeo por sessão. As duas portas exigem TLS e depois PAIR/AUTH
+/// antes do HELLO. A porta USB escuta só em loopback (o `adb reverse` chega por ali). Responde PING com PONG e manda o
+/// próprio PING a cada segundo. Atende um cliente por vez em cada porta; um cliente mudo é derrubado por prazo
+/// (handshake e ociosidade). O vídeo é de uma sessão por vez: a mais nova assume.
 /// </summary>
 public sealed class HostServer : IDisposable
 {
@@ -29,6 +32,9 @@ public sealed class HostServer : IDisposable
     private readonly TimeSpan _handshakeTimeout;
     private readonly TimeSpan _idleTimeout;
     private readonly IVirtualMonitorManager _monitors;
+    private readonly IVideoSource? _video;
+    private readonly TimeSpan _pingInterval;
+    private readonly TimeSpan _videoConfigTimeout;
 
     /// <param name="handshakeTimeout">Prazo para TLS + PAIR/AUTH em qualquer porta (padrão 10 s).</param>
     /// <param name="idleTimeout">
@@ -36,9 +42,13 @@ public sealed class HostServer : IDisposable
     /// então 10 s sem nada é conexão morta (celular sem Wi-Fi, fora de alcance) e não pode prender a porta.
     /// </param>
     /// <param name="monitors">Monitor virtual por sessão (padrão: nenhum; o CONFIG leva a resolução pedida pelo celular, já normalizada).</param>
+    /// <param name="video">Vídeo por sessão (padrão: nenhum; o celular recebe só o CONFIG de fallback).</param>
+    /// <param name="pingInterval">Intervalo do PING do PC depois do CONFIG (padrão 1 s).</param>
+    /// <param name="videoConfigTimeout">Sem CONFIG do vídeo nesse prazo, sai o de fallback (padrão 2 s).</param>
     public HostServer(int wifiPort, int usbPort, HostIdentity identity, PairingSession pairing, DeviceRegistry devices,
         Action<string>? log = null, TimeSpan? handshakeTimeout = null, TimeSpan? idleTimeout = null,
-        IVirtualMonitorManager? monitors = null)
+        IVirtualMonitorManager? monitors = null, IVideoSource? video = null, TimeSpan? pingInterval = null,
+        TimeSpan? videoConfigTimeout = null)
     {
         _wifi = new TcpListener(IPAddress.Any, wifiPort);
         _usb = new TcpListener(IPAddress.Loopback, usbPort);
@@ -49,6 +59,9 @@ public sealed class HostServer : IDisposable
         _handshakeTimeout = handshakeTimeout ?? TimeSpan.FromSeconds(10);
         _idleTimeout = idleTimeout ?? TimeSpan.FromSeconds(10);
         _monitors = monitors ?? NullVirtualMonitorManager.Instance;
+        _video = video is null ? null : new ExclusiveVideoSource(video);
+        _pingInterval = pingInterval ?? TimeSpan.FromSeconds(1);
+        _videoConfigTimeout = videoConfigTimeout ?? TimeSpan.FromSeconds(2);
     }
 
     /// <summary>Porta Wi-Fi (TLS) em que está escutando.</summary>
@@ -65,10 +78,10 @@ public sealed class HostServer : IDisposable
 
     /// <summary>Atende as duas portas até o token ser cancelado.</summary>
     public Task RunAsync(CancellationToken cancellationToken) => Task.WhenAll(
-        AcceptLoopAsync(_wifi, "Wi-Fi", cancellationToken),
-        AcceptLoopAsync(_usb, "USB", cancellationToken));
+        AcceptLoopAsync(_wifi, "Wi-Fi", VideoLink.Wifi, cancellationToken),
+        AcceptLoopAsync(_usb, "USB", VideoLink.Usb, cancellationToken));
 
-    private async Task AcceptLoopAsync(TcpListener listener, string portLabel, CancellationToken cancellationToken)
+    private async Task AcceptLoopAsync(TcpListener listener, string portLabel, VideoLink link, CancellationToken cancellationToken)
     {
         try
         {
@@ -78,8 +91,11 @@ public sealed class HostServer : IDisposable
                 try
                 {
                     client.NoDelay = true;
+                    // Buffer de envio fixo: o ajuste automático do Windows cresce até vários MB e esconde a rede travada
+                    // (os quadros envelheceriam lá dentro). Com 512 KiB, a fila do SessionWriter percebe e descarta até um IDR.
+                    client.Client.SendBufferSize = 512 * 1024;
                     _log?.Invoke($"Cliente conectado ({portLabel}): {client.Client.RemoteEndPoint}");
-                    await ServeSecureAsync(client.GetStream(), cancellationToken);
+                    await ServeSecureAsync(client.GetStream(), link, cancellationToken);
                 }
                 catch (Exception e) when (!(e is OperationCanceledException && cancellationToken.IsCancellationRequested))
                 {
@@ -96,7 +112,7 @@ public sealed class HostServer : IDisposable
         }
     }
 
-    private async Task ServeSecureAsync(NetworkStream network, CancellationToken cancellationToken)
+    private async Task ServeSecureAsync(NetworkStream network, VideoLink link, CancellationToken cancellationToken)
     {
         await using var tls = new SslStream(network, leaveInnerStreamOpen: false);
         // TLS e PAIR/AUTH precisam terminar dentro do prazo: um cliente calado não pode prender a porta.
@@ -133,11 +149,15 @@ public sealed class HostServer : IDisposable
         }
 
         _log?.Invoke($"Autenticado: {Sanitize(known.Name)} (id {known.Id})");
-        await ServeSessionAsync(tls, reader, cancellationToken);
+        await ServeSessionAsync(tls, reader, link, cancellationToken);
     }
 
-    /// <summary>HELLO → CONFIG, depois PING → PONG até o cliente sair ou ficar mudo além do prazo ocioso.</summary>
-    private async Task ServeSessionAsync(Stream stream, MessageReader reader, CancellationToken cancellationToken)
+    /// <summary>
+    /// HELLO → monitor → vídeo (ou CONFIG de fallback), PING do PC a cada intervalo e o laço de leitura, até o cliente
+    /// sair, ficar mudo além do prazo ocioso ou a rede falhar. Daqui em diante só o SessionWriter escreve no stream.
+    /// Encerramento: vídeo, escritor, monitor.
+    /// </summary>
+    private async Task ServeSessionAsync(Stream stream, MessageReader reader, VideoLink link, CancellationToken cancellationToken)
     {
         if (await ReadWithIdleDeadlineAsync(reader, cancellationToken) is not HelloMessage hello)
             return; // primeira mensagem não é HELLO: fecha
@@ -152,14 +172,124 @@ public sealed class HostServer : IDisposable
         using var lease = _monitors.Acquire(hello.Width, hello.Height, hello.DensityDpi);
         if (lease.Monitor is { } monitor)
             _log?.Invoke($"Monitor virtual: {monitor.DeviceName} {monitor.Width}×{monitor.Height} em ({monitor.X},{monitor.Y}), escala {monitor.ScalePercent}%.");
-        await SendAsync(stream, new ConfigMessage((ushort)lease.Width, (ushort)lease.Height, VideoCodec.H264, StubBitrateKbps, []), cancellationToken);
+        var fallback = new ConfigMessage((ushort)lease.Width, (ushort)lease.Height, VideoCodec.H264, StubBitrateKbps, []);
 
+        using var session = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var writer = new SessionWriter(stream, () => PcClock.NowUs);
+        var writing = writer.RunAsync(session.Token);
+        Task reading = Task.CompletedTask;
+        IVideoStream? video = null;
+        try
+        {
+            if (_video is not null)
+                video = await _video.StartAsync(new VideoRequest(lease, hello.SupportedCodecs, link), new WriterOutput(writer), session.Token);
+            if (video is null)
+            {
+                writer.SendFallbackConfig(fallback);
+            }
+            else
+            {
+                var started = video;
+                writer.KeyframeNeeded += () => RequestKeyframe(started);
+                _ = SendFallbackLaterAsync(writer, fallback, session.Token);
+            }
+            _ = PingAsync(writer, session.Token);
+
+            reading = ReadLoopAsync(reader, writer, video, session.Token);
+            // O que terminar primeiro encerra a sessão: o cliente (fim, prazo, protocolo) ou o escritor (rede).
+            await await Task.WhenAny(reading, writing);
+        }
+        finally
+        {
+            if (video is not null) await video.DisposeAsync();
+            await session.CancelAsync();
+            await IgnoreErrorsAsync(writing);
+            await IgnoreErrorsAsync(reading);
+        }
+    }
+
+    /// <summary>PING → PONG, KEYFRAME_REQ → vídeo. Termina quando o cliente fecha; prazo estourado lança.</summary>
+    private async Task ReadLoopAsync(MessageReader reader, SessionWriter writer, IVideoStream? video, CancellationToken cancellationToken)
+    {
         while (await ReadWithIdleDeadlineAsync(reader, cancellationToken) is { } message)
         {
-            if (message is PingMessage ping)
-                await SendAsync(stream, new PongMessage(ping.TimestampUs), cancellationToken);
-            // demais mensagens (TOUCH, KEYFRAME_REQ) são ignoradas: este stub não tem vídeo nem toque
+            switch (message)
+            {
+                case PingMessage ping:
+                    writer.Send(new PongMessage(ping.TimestampUs));
+                    break;
+                case KeyframeRequestMessage when video is not null:
+                    RequestKeyframe(video);
+                    break;
+                // demais mensagens (PONG, TOUCH) são ignoradas: ainda não há toque
+            }
         }
+    }
+
+    /// <summary>PING do PC a cada intervalo, depois do primeiro CONFIG: o celular acerta o relógio e mede a latência com ele.</summary>
+    private async Task PingAsync(SessionWriter writer, CancellationToken cancellationToken)
+    {
+        using var timer = new PeriodicTimer(_pingInterval);
+        try
+        {
+            while (await timer.WaitForNextTickAsync(cancellationToken))
+            {
+                if (writer.ConfigSent) writer.SendPing();
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // fim da sessão
+        }
+    }
+
+    /// <summary>O vídeo não mandou CONFIG a tempo (captura ainda abrindo, encoder travado): o celular sai da espera.</summary>
+    private async Task SendFallbackLaterAsync(SessionWriter writer, ConfigMessage fallback, CancellationToken cancellationToken)
+    {
+        try
+        {
+            await Task.Delay(_videoConfigTimeout, cancellationToken);
+            if (writer.SendFallbackConfig(fallback))
+                _log?.Invoke($"O vídeo não começou em {_videoConfigTimeout.TotalSeconds:0.#} s; o celular recebeu um CONFIG sem vídeo.");
+        }
+        catch (OperationCanceledException)
+        {
+            // fim da sessão
+        }
+    }
+
+    /// <summary>Chamado pelo laço de leitura e pelo escritor (thread do encoder): nunca lança.</summary>
+    private void RequestKeyframe(IVideoStream video)
+    {
+        try
+        {
+            video.RequestKeyframe();
+        }
+        catch (Exception e)
+        {
+            _log?.Invoke($"Falha ao pedir keyframe: {e.Message}");
+        }
+    }
+
+    /// <summary>Espera uma tarefa da sessão que já foi cancelada; o erro dela já foi tratado (ou não importa mais).</summary>
+    private static async Task IgnoreErrorsAsync(Task task)
+    {
+        try
+        {
+            await task;
+        }
+        catch (Exception)
+        {
+            // cancelada ou já propagada pela sessão
+        }
+    }
+
+    /// <summary>O vídeo escreve pelo escritor da sessão.</summary>
+    private sealed class WriterOutput(SessionWriter writer) : IVideoOutput
+    {
+        public void OnConfig(ConfigMessage config) => writer.SendVideoConfig(config);
+        public void OnFrame(FrameMessage frame) => writer.SendVideoFrame(frame);
+        public int PendingFrames => writer.PendingFrames;
     }
 
     /// <summary>
