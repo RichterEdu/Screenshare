@@ -35,6 +35,7 @@ public sealed class HostServer : IDisposable
     private readonly IVideoSource? _video;
     private readonly TimeSpan _pingInterval;
     private readonly TimeSpan _videoConfigTimeout;
+    private readonly TimeSpan _statsInterval;
 
     /// <param name="handshakeTimeout">Prazo para TLS + PAIR/AUTH em qualquer porta (padrão 10 s).</param>
     /// <param name="idleTimeout">
@@ -45,10 +46,11 @@ public sealed class HostServer : IDisposable
     /// <param name="video">Vídeo por sessão (padrão: nenhum; o celular recebe só o CONFIG de fallback).</param>
     /// <param name="pingInterval">Intervalo do PING do PC depois do CONFIG (padrão 1 s).</param>
     /// <param name="videoConfigTimeout">Sem CONFIG do vídeo nesse prazo, sai o de fallback (padrão 2 s).</param>
+    /// <param name="statsInterval">Intervalo das estatísticas do vídeo no console (padrão 5 s).</param>
     public HostServer(int wifiPort, int usbPort, HostIdentity identity, PairingSession pairing, DeviceRegistry devices,
         Action<string>? log = null, TimeSpan? handshakeTimeout = null, TimeSpan? idleTimeout = null,
         IVirtualMonitorManager? monitors = null, IVideoSource? video = null, TimeSpan? pingInterval = null,
-        TimeSpan? videoConfigTimeout = null)
+        TimeSpan? videoConfigTimeout = null, TimeSpan? statsInterval = null)
     {
         _wifi = new TcpListener(IPAddress.Any, wifiPort);
         _usb = new TcpListener(IPAddress.Loopback, usbPort);
@@ -63,6 +65,7 @@ public sealed class HostServer : IDisposable
         _pingInterval = pingInterval ?? TimeSpan.FromSeconds(1);
         ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(_pingInterval, TimeSpan.Zero, nameof(pingInterval));
         _videoConfigTimeout = videoConfigTimeout ?? TimeSpan.FromSeconds(2);
+        _statsInterval = statsInterval ?? TimeSpan.FromSeconds(5);
     }
 
     /// <summary>Porta Wi-Fi (TLS) em que está escutando.</summary>
@@ -178,10 +181,15 @@ public sealed class HostServer : IDisposable
         using var session = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         var writer = new SessionWriter(stream, () => PcClock.NowUs);
         var video = new SessionVideo(this);
-        writer.KeyframeNeeded += video.RequestKeyframe; // assinado antes de o vídeo começar: nenhum descarte fica sem pedido
+        var stats = new SessionStats();
+        writer.KeyframeNeeded += () => // assinado antes de o vídeo começar: nenhum descarte fica sem pedido
+        {
+            stats.CountDrop();
+            video.RequestKeyframe();
+        };
         var writing = writer.RunAsync(session.Token);
         // A leitura, o PING e o prazo do fallback começam já: enquanto o vídeo abre, o celular é atendido.
-        var reading = ReadLoopAsync(reader, writer, video, session.Token);
+        var reading = ReadLoopAsync(reader, writer, video, stats, session.Token);
         _ = PingAsync(writer, session.Token);
         // A abertura do vídeo tem cancelamento próprio: se o celular sair enquanto ela demora, ela é cancelada antes de
         // o vídeo ser encerrado, e o escritor só para depois.
@@ -196,7 +204,8 @@ public sealed class HostServer : IDisposable
             else
             {
                 _ = SendFallbackLaterAsync(writer, fallback, session.Token);
-                starting = AttachVideoAsync(new VideoRequest(lease, hello.SupportedCodecs, link), writer, video, fallback, opening.Token);
+                starting = AttachVideoAsync(new VideoRequest(lease, hello.SupportedCodecs, link), writer, video, fallback, stats,
+                    opening.Token);
             }
             // O que terminar primeiro encerra a sessão: o cliente (fim, prazo, protocolo) ou o escritor (rede). A abertura
             // do vídeo terminar não encerra nada; a sessão segue esperando os outros dois.
@@ -219,13 +228,17 @@ public sealed class HostServer : IDisposable
         }
     }
 
-    /// <summary>Abre o vídeo e o liga à sessão; sem vídeo (falha ou sem encoder), o celular recebe o CONFIG de fallback.</summary>
+    /// <summary>
+    /// Abre o vídeo e o liga à sessão, com as estatísticas no console; sem vídeo (falha ou sem encoder), o celular recebe
+    /// o CONFIG de fallback.
+    /// </summary>
     private async Task AttachVideoAsync(VideoRequest request, SessionWriter writer, SessionVideo video, ConfigMessage fallback,
-        CancellationToken cancellationToken)
+        SessionStats stats, CancellationToken cancellationToken)
     {
         var started = await StartVideoAsync(request, new WriterOutput(writer), cancellationToken);
         video.Start(started);
         if (started is null) writer.SendFallbackConfig(fallback);
+        else _ = LogStatsAsync(started, stats, cancellationToken);
     }
 
     /// <summary>Começa o vídeo da sessão; uma falha vira sessão sem vídeo (o celular recebe o CONFIG de fallback).</summary>
@@ -242,8 +255,9 @@ public sealed class HostServer : IDisposable
         }
     }
 
-    /// <summary>PING → PONG, KEYFRAME_REQ → vídeo. Termina quando o cliente fecha; prazo estourado lança.</summary>
-    private async Task ReadLoopAsync(MessageReader reader, SessionWriter writer, SessionVideo video, CancellationToken cancellationToken)
+    /// <summary>PING → PONG, KEYFRAME_REQ → vídeo, PONG → RTT. Termina quando o cliente fecha; prazo estourado lança.</summary>
+    private async Task ReadLoopAsync(MessageReader reader, SessionWriter writer, SessionVideo video, SessionStats stats,
+        CancellationToken cancellationToken)
     {
         while (await ReadWithIdleDeadlineAsync(reader, cancellationToken) is { } message)
         {
@@ -255,7 +269,10 @@ public sealed class HostServer : IDisposable
                 case KeyframeRequestMessage:
                     video.RequestKeyframe();
                     break;
-                // demais mensagens (PONG, TOUCH) são ignoradas: ainda não há toque
+                case PongMessage pong:
+                    stats.SetRtt(PcClock.NowUs, pong.TimestampUs);
+                    break;
+                // TOUCH é ignorado: ainda não há toque
             }
         }
     }
@@ -292,6 +309,30 @@ public sealed class HostServer : IDisposable
         }
     }
 
+    /// <summary>Uma linha de estatísticas do vídeo a cada intervalo, enquanto a sessão durar.</summary>
+    private async Task LogStatsAsync(IVideoStream video, SessionStats stats, CancellationToken cancellationToken)
+    {
+        using var timer = new PeriodicTimer(_statsInterval);
+        var previous = video.Stats;
+        var since = TimeProvider.System.GetTimestamp();
+        try
+        {
+            while (await timer.WaitForNextTickAsync(cancellationToken))
+            {
+                var current = video.Stats;
+                var now = TimeProvider.System.GetTimestamp();
+                _log?.Invoke(VideoStatsLine.Format(previous, current, TimeProvider.System.GetElapsedTime(since, now),
+                    stats.TakeDrops(), stats.RttMs));
+                previous = current;
+                since = now;
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // fim da sessão
+        }
+    }
+
     /// <summary>Chamado pelo laço de leitura e pelo escritor (thread do encoder): nunca lança.</summary>
     private void RequestKeyframe(IVideoStream video)
     {
@@ -315,6 +356,24 @@ public sealed class HostServer : IDisposable
         catch (Exception)
         {
             // cancelada ou já propagada pela sessão
+        }
+    }
+
+    /// <summary>Contadores da sessão para as estatísticas: descartes na fila e o RTT do último PONG.</summary>
+    private sealed class SessionStats
+    {
+        private int _drops;
+        private long _rttUs = -1;
+
+        public double? RttMs => Interlocked.Read(ref _rttUs) is var rtt and >= 0 ? rtt / 1000.0 : null;
+
+        public void CountDrop() => Interlocked.Increment(ref _drops);
+
+        public int TakeDrops() => Interlocked.Exchange(ref _drops, 0);
+
+        public void SetRtt(ulong nowUs, ulong pingUs)
+        {
+            if (nowUs >= pingUs) Interlocked.Exchange(ref _rttUs, (long)(nowUs - pingUs));
         }
     }
 

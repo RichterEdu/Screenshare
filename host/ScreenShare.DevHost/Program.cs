@@ -3,12 +3,28 @@ using Makaretu.Dns;
 using QRCoder;
 using ScreenShare.Core.Security;
 using ScreenShare.DevHost;
+using ScreenShare.Video;
+using ScreenShare.Video.Hardware;
 
 // Host de desenvolvimento: Wi-Fi com TLS + pareamento por QR (porta 38700) e USB com TLS + pareamento, só em loopback (porta 38701).
 // Comandos no console: p = parear celular (mostra o QR), l = listar pareados, r <id> = remover, Ctrl+C = sair.
 // Modos de linha de comando (pedem administrador): install-driver, uninstall-driver, restart-driver.
-// Opção: --sem-monitor (não liga o monitor virtual nem mexe no driver).
+// Opções: --sem-monitor (não liga o monitor virtual nem mexe no driver), --sem-video, --capturar principal (vídeo do
+// monitor principal, para depurar sem o driver), --gravar <arquivo> (o vídeo em Annex-B, para o ffplay),
+// --fps <1-120> (padrão 60), --bitrate <Mbps> (padrão 50 no cabo e 25 no Wi-Fi), --codec h264|h265|auto.
 if (DriverCommands.IsDriverCommand(args)) return await DriverCommands.RunAsync(args);
+
+DevHostOptions options;
+try
+{
+    options = DevHostOptions.Parse(args);
+}
+catch (OptionsException ex)
+{
+    Console.Error.WriteLine(ex.Message);
+    Console.Error.WriteLine(DevHostOptions.Usage);
+    return 2;
+}
 
 const int WifiPort = 38700;
 const int UsbPort = 38701;
@@ -22,7 +38,12 @@ var pairing = new PairingSession(TimeProvider.System);
 var devices = new DeviceRegistry(Path.Combine(dataDirectory, "paired-devices.json"), log: Log);
 
 // Monitor virtual: liga quando um celular conecta (--sem-monitor desliga o recurso e não mexe no driver).
-using var monitors = args.Contains("--sem-monitor") ? null : MonitorSetup.Create(Log);
+using var monitors = options.NoMonitor ? null : MonitorSetup.Create(Log);
+
+// Vídeo: captura + encoder de hardware por sessão (--sem-video desliga).
+var video = options.NoVideo ? null : VideoSourceFactory.CreateDefault(options.Video, Log);
+if (video is not null && options.CapturePrimary) video = new MonitorOverrideVideoSource(video, () => new PrimaryMonitorSource());
+if (video is not null && options.RecordPath is { } recordPath) video = new RecordingVideoSource(video, recordPath, Log);
 
 using var cts = new CancellationTokenSource();
 Console.CancelKeyPress += (_, e) =>
@@ -31,7 +52,7 @@ Console.CancelKeyPress += (_, e) =>
     cts.Cancel();
 };
 
-using var server = new HostServer(WifiPort, UsbPort, identity, pairing, devices, Log, monitors: monitors);
+using var server = new HostServer(WifiPort, UsbPort, identity, pairing, devices, Log, monitors: monitors, video: video);
 server.Start();
 
 // Anuncia só IPs da LAN real; sem nenhum (ex.: sem gateway), cai no padrão da biblioteca (todos os IPs).
@@ -47,6 +68,9 @@ Console.WriteLine($"IPs anunciados: {(lanAddresses.Count > 0 ? string.Join(", ",
 Console.WriteLine(monitors is null
     ? "Monitor virtual: desligado (sem driver ou --sem-monitor); o CONFIG leva a resolução do celular."
     : "Monitor virtual: pronto; liga quando um celular conecta e sai da área de trabalho 10 s depois que ele desconecta.");
+Console.WriteLine(video is null
+    ? "Vídeo: desligado (sem encoder de hardware ou --sem-video)."
+    : $"Vídeo: até {options.Video.Fps} fps{(options.CapturePrimary ? ", capturando o monitor principal" : "")}.");
 Console.WriteLine("Comandos: p = parear celular, l = listar pareados, r <id> = remover, Ctrl+C = sair.");
 
 // Uma falha num comando (ex.: erro de disco ao remover um celular) não pode encerrar o laço: p/l/r continuam respondendo.
