@@ -37,6 +37,18 @@ class ClockSyncTest {
     }
 
     @Test
+    fun invalidRttIsIgnored() {
+        val sync = ClockSync()
+        sync.ping(1_000_000)
+        sync.onRtt(2 * oneWay, 1_000_000 + offset)
+
+        sync.onRtt(-5_000, 1_100_000 + offset)
+        sync.onRtt(0, 1_200_000 + offset)
+
+        assertEquals(offset, sync.offsetUs())
+    }
+
+    @Test
     fun oldSamplesLeaveAfterTwentySecondsSoDriftIsFollowed() {
         val sync = ClockSync()
         sync.ping(1_000_000)

@@ -16,9 +16,11 @@ class ClockSync(private val windowUs: Long = 20_000_000) {
     @Synchronized
     fun onPcPing(pcUs: Long, receivedUs: Long) = add(pings, receivedUs, receivedUs - pcUs)
 
-    /** Um RTT medido pelos PINGs do próprio celular. */
+    /** Um RTT medido pelos PINGs do próprio celular. Zero ou negativo (PONG inválido) é ignorado. */
     @Synchronized
-    fun onRtt(rttUs: Long, atUs: Long) = add(rtts, atUs, rttUs)
+    fun onRtt(rttUs: Long, atUs: Long) {
+        if (rttUs > 0) add(rtts, atUs, rttUs)
+    }
 
     /** Relógio do celular − relógio do PC, em µs; null até ter um PING do PC e um RTT. */
     @Synchronized

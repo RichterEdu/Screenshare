@@ -531,9 +531,9 @@ class ConnectionTest {
         val connection = newConnection(idleTimeoutMs = 300)
 
         connection.connect(usb())
-        val state = connection.await { it is ConnectionState.Failed }
+        val state = connection.await { it is ConnectionState.Failed } as ConnectionState.Failed
 
-        assertTrue(state is ConnectionState.Failed)
+        assertTrue(state.reason, state.reason.startsWith("O PC parou de responder"))
         serverSide.await()
     }
 

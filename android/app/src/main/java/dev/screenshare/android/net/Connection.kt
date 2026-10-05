@@ -110,10 +110,11 @@ class Connection(
 
     fun connect(target: ConnectTarget) {
         disconnect()
-        clock = ClockSync()
+        // Cada conexão tem o seu relógio: uma conexão antiga que ainda esteja terminando não mexe no da nova.
+        val sync = ClockSync().also { clock = it }
         _state.value = ConnectionState.Connecting
         val s = Socket().also { socket = it } // guardado já aqui para disconnect() poder interromper o connect
-        job = scope.launch(Dispatchers.IO) { run(s, target) }
+        job = scope.launch(Dispatchers.IO) { run(s, target, sync) }
     }
 
     /** Pede ao PC um quadro completo (decoder novo ou com erro). Não bloqueia; sem conexão, não faz nada. */
@@ -136,7 +137,8 @@ class Connection(
         _state.value = ConnectionState.Disconnected
     }
 
-    private suspend fun run(raw: Socket, target: ConnectTarget) {
+    private suspend fun run(raw: Socket, target: ConnectTarget, clock: ClockSync) {
+        var connected = false
         try {
             val (host, port) = target.endpoint()
             raw.tcpNoDelay = true
@@ -183,8 +185,9 @@ class Connection(
             s.soTimeout = idleTimeoutMs // o PC pinga a cada segundo: mudo por mais que isso é conexão morta
             // disconnect() pode ter corrido com a leitura do CONFIG: não publicar Connected depois de Disconnected
             if (!currentCoroutineContext().isActive) return
+            output = out // antes de Connected: quem reage a Connected já pode pedir keyframe
+            connected = true
             _state.value = ConnectionState.Connected(config, rttMs = null)
-            output = out
             sink.onConfig(config)
             val pinger = scope.launch(Dispatchers.IO) {
                 while (isActive) {
@@ -221,9 +224,14 @@ class Connection(
                 }
             } finally {
                 pinger.cancel()
-                output = null
+                if (output === out) output = null // um connect() novo pode já ter posto a saída dele
             }
             fail("Conexão perdida")
+        } catch (e: SocketTimeoutException) {
+            fail(
+                if (connected) "O PC parou de responder (nada chegou em ${idleTimeoutMs / 1_000} s). Confira a rede e conecte de novo."
+                else e.describe(),
+            )
         } catch (e: IOException) { // inclui ProtocolException, EOFException e erros de TLS
             fail(e.describe())
         } catch (e: CancellationException) {
