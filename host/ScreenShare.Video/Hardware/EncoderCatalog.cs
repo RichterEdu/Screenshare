@@ -34,12 +34,32 @@ internal static class EncoderCatalog
         }
     }
 
-    /// <summary>O encoder do codec feito pelo mesmo fabricante da placa (0x10DE = NVIDIA), ou null.</summary>
-    public static IMFActivate? Find(VideoCodec codec, uint vendorId)
+    /// <summary>MFT_ENUM_ADAPTER_LUID: a placa a que o encoder de hardware pertence.</summary>
+    private static readonly Guid AdapterLuidKey = new("1d39518c-e220-4da8-a07f-ba172552d6b1");
+
+    /// <summary>
+    /// O encoder do codec na mesma placa (LUID) da captura; se o driver não informar a placa, o primeiro do mesmo
+    /// fabricante (0x10DE = NVIDIA). null se não houver.
+    /// </summary>
+    public static IMFActivate? Find(VideoCodec codec, uint vendorId, long adapterLuid)
     {
         var vendor = $"VEN_{vendorId:X4}";
-        return List(codec).FirstOrDefault(activate =>
-            string.Equals(VendorOf(activate), vendor, StringComparison.OrdinalIgnoreCase));
+        var sameVendor = List(codec)
+            .Where(activate => string.Equals(VendorOf(activate), vendor, StringComparison.OrdinalIgnoreCase))
+            .ToList();
+        return sameVendor.FirstOrDefault(activate => LuidOf(activate) == adapterLuid) ?? sameVendor.FirstOrDefault();
+    }
+
+    private static long? LuidOf(IMFActivate activate)
+    {
+        try
+        {
+            return (long)activate.GetUInt64(AdapterLuidKey);
+        }
+        catch (Exception)
+        {
+            return null;
+        }
     }
 
     public static string NameOf(IMFActivate activate)

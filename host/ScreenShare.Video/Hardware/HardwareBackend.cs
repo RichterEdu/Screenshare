@@ -32,7 +32,7 @@ internal sealed class HardwareBackend : IVideoBackend
     public IVideoEncoder CreateEncoder(EncoderSettings settings)
     {
         var gpu = _gpu ?? throw new InvalidOperationException("a captura abre antes do encoder");
-        var activate = EncoderCatalog.Find(settings.Codec, gpu.VendorId)
+        var activate = EncoderCatalog.Find(settings.Codec, gpu.VendorId, gpu.AdapterLuid)
             ?? throw new EncoderUnavailableException($"a placa não tem encoder {CodecChooser.Name(settings.Codec)}");
         try
         {
@@ -45,6 +45,10 @@ internal sealed class HardwareBackend : IVideoBackend
         catch (SharpGenException e)
         {
             throw new EncoderUnavailableException($"{EncoderCatalog.NameOf(activate)}: 0x{e.HResult:X8}", e);
+        }
+        catch (Exception e) when (e is not DeviceLostException)
+        {
+            throw new EncoderUnavailableException($"{EncoderCatalog.NameOf(activate)}: {e.Message}", e);
         }
     }
 

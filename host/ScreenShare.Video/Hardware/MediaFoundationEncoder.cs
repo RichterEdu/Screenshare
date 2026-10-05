@@ -38,21 +38,57 @@ internal sealed class MediaFoundationEncoder : IVideoEncoder
     private readonly int _outputSize;
     private readonly Thread _thread;
     private int _inputRequests;
+    private int _disposed;
     private volatile bool _stopping;
 
+    /// <summary>
+    /// Configura e começa o encoder. Se algo falhar no meio, solta tudo o que já criou e desativa o MFT
+    /// (ShutdownObject): sem isso, o IMFActivate devolveria na próxima tentativa o mesmo MFT meio configurado.
+    /// </summary>
     public MediaFoundationEncoder(GpuContext gpu, IMFActivate activate, EncoderSettings settings)
     {
         _settings = settings;
         _activate = activate;
-        _transform = activate.ActivateObject<IMFTransform>();
+        var created = new Stack<IDisposable>();
+        try
+        {
+            _transform = Track(created, activate.ActivateObject<IMFTransform>());
+            _manager = Track(created, MediaFactory.MFCreateDXGIDeviceManager());
+            _api = Track(created, new CodecApi(_transform));
+            _inputType = Track(created, InputType(settings));
+            _allocator = Track(created,
+                new IMFVideoSampleAllocatorEx(MediaFactory.MFCreateVideoSampleAllocatorEx(typeof(IMFVideoSampleAllocatorEx).GUID)));
+            (_providesSamples, _outputSize) = Configure(gpu, settings);
+            _converter = Track(created, new Nv12Converter(gpu, settings.Width, settings.Height, settings.Fps));
+            _transform.ProcessMessage(TMessageType.MessageNotifyBeginStreaming, UIntPtr.Zero);
+            _transform.ProcessMessage(TMessageType.MessageNotifyStartOfStream, UIntPtr.Zero);
+            _events = Track(created, _transform.QueryInterface<IMFMediaEventGenerator>());
+        }
+        catch
+        {
+            while (created.TryPop(out var item)) item.Dispose();
+            activate.ShutdownObject();
+            throw;
+        }
+        _thread = new Thread(RunEvents) { IsBackground = true, Name = "ScreenShare encoder", Priority = ThreadPriority.AboveNormal };
+        _thread.Start();
+    }
+
+    private static T Track<T>(Stack<IDisposable> created, T item) where T : IDisposable
+    {
+        created.Push(item);
+        return item;
+    }
+
+    /// <summary>Atributos, ajustes do ICodecAPI, tipos de saída e de entrada e o pool de amostras NV12.</summary>
+    private (bool ProvidesSamples, int OutputSize) Configure(GpuContext gpu, EncoderSettings settings)
+    {
         _transform.Attributes.Set(TransformAttributeKeys.TransformAsyncUnlock, 1u);
         _transform.Attributes.Set(CodecApi.LowLatency, 1u); // MF_LOW_LATENCY tem o mesmo GUID
 
-        _manager = MediaFactory.MFCreateDXGIDeviceManager();
         _manager.ResetDevice(gpu.Device).CheckError();
         _transform.ProcessMessage(TMessageType.MessageSetD3DManager, (UIntPtr)(nuint)_manager.NativePointer);
 
-        _api = new CodecApi(_transform);
         _api.SetBool(CodecApi.LowLatency, true);
         _api.SetUInt32(CodecApi.GopSize, MaxGop);
         _api.SetUInt32(CodecApi.RateControl, CodecApi.PeakConstrainedVbr);
@@ -63,13 +99,9 @@ internal sealed class MediaFoundationEncoder : IVideoEncoder
         _api.SetUInt32(CodecApi.BufferSize, peak / (uint)settings.Fps * 3); // ~3 quadros no pico
 
         using (var outputType = OutputType(settings, bitrate)) _transform.SetOutputType(0, outputType, 0);
-        _inputType = InputType(settings);
         _transform.SetInputType(0, _inputType, 0);
         var info = _transform.GetOutputStreamInfo(0);
-        _providesSamples = (info.Flags & (ProvidesSamples | CanProvideSamples)) != 0;
-        _outputSize = Math.Max(info.Size, settings.Width * settings.Height);
 
-        _allocator = new IMFVideoSampleAllocatorEx(MediaFactory.MFCreateVideoSampleAllocatorEx(typeof(IMFVideoSampleAllocatorEx).GUID));
         _allocator.SetDirectXManager(_manager);
         using (var attributes = MediaFactory.MFCreateAttributes(2))
         {
@@ -77,13 +109,7 @@ internal sealed class MediaFoundationEncoder : IVideoEncoder
             attributes.Set(TransformAttributeKeys.D3D11Usage, (uint)ResourceUsage.Default);
             _allocator.InitializeSampleAllocatorEx(3, 6, attributes, _inputType);
         }
-        _converter = new Nv12Converter(gpu, settings.Width, settings.Height, settings.Fps);
-
-        _transform.ProcessMessage(TMessageType.MessageNotifyBeginStreaming, UIntPtr.Zero);
-        _transform.ProcessMessage(TMessageType.MessageNotifyStartOfStream, UIntPtr.Zero);
-        _events = _transform.QueryInterface<IMFMediaEventGenerator>();
-        _thread = new Thread(RunEvents) { IsBackground = true, Name = "ScreenShare encoder", Priority = ThreadPriority.AboveNormal };
-        _thread.Start();
+        return ((info.Flags & (ProvidesSamples | CanProvideSamples)) != 0, Math.Max(info.Size, settings.Width * settings.Height));
     }
 
     public VideoCodec Codec => _settings.Codec;
@@ -118,6 +144,7 @@ internal sealed class MediaFoundationEncoder : IVideoEncoder
 
     public void Dispose()
     {
+        if (Interlocked.Exchange(ref _disposed, 1) == 1) return;
         _stopping = true;
         try
         {
@@ -164,37 +191,58 @@ internal sealed class MediaFoundationEncoder : IVideoEncoder
         }
     }
 
+    /// <summary>Pega a saída pronta. Depois de uma troca de formato (STREAM_CHANGE) tenta uma vez mais, para não perder o quadro.</summary>
     private void DrainOutput()
     {
-        var buffer = new OutputDataBuffer { StreamID = 0 };
-        IMFSample? own = null;
-        if (!_providesSamples)
+        for (var attempt = 0; attempt < 2; attempt++)
         {
-            own = MediaFactory.MFCreateSample();
-            using var memory = MediaFactory.MFCreateMemoryBuffer(_outputSize);
-            own.AddBuffer(memory);
-            buffer.Sample = own;
-        }
-        try
-        {
-            var result = _transform.ProcessOutput(ProcessOutputFlags.None, 1, ref buffer, out _);
-            if (result.Code == StreamChange)
+            var buffer = new OutputDataBuffer { StreamID = 0 };
+            IMFSample? own = null;
+            if (!_providesSamples)
             {
-                using var available = _transform.GetOutputAvailableType(0, 0);
-                _transform.SetOutputType(0, available, 0);
+                own = MediaFactory.MFCreateSample();
+                using var memory = MediaFactory.MFCreateMemoryBuffer(_outputSize);
+                own.AddBuffer(memory);
+                buffer.Sample = own;
+            }
+            try
+            {
+                var result = _transform.ProcessOutput(ProcessOutputFlags.None, 1, ref buffer, out _);
+                if (result.Code == StreamChange)
+                {
+                    using var available = _transform.GetOutputAvailableType(0, 0);
+                    _transform.SetOutputType(0, available, 0);
+                    continue;
+                }
+                result.CheckError();
+                var data = CopyBytes(buffer.Sample!);
+                var timestamp = (ulong)(buffer.Sample!.SampleTime / 10);
+                Output?.Invoke(new EncodedFrame(timestamp, AnnexB.IsKeyframe(data, _settings.Codec), data));
                 return;
             }
-            result.CheckError();
-            var data = CopyBytes(buffer.Sample!);
-            var timestamp = (ulong)(buffer.Sample!.SampleTime / 10);
-            Output?.Invoke(new EncodedFrame(timestamp, AnnexB.IsKeyframe(data, _settings.Codec), data));
+            finally
+            {
+                buffer.Events?.Dispose();
+                ReleaseOutputSample(buffer.Sample, own);
+                own?.Dispose();
+            }
         }
-        finally
+    }
+
+    /// <summary>
+    /// O Vortice devolve a amostra de saída num objeto novo que não fez AddRef. Se é a nossa (own), esse objeto não pode
+    /// liberar nada: o own já libera a única referência, e liberar duas vezes derruba o processo. Se o MFT forneceu a
+    /// amostra, o objeto novo é a referência que o MFT nos deu, e é liberado uma vez.
+    /// </summary>
+    internal static void ReleaseOutputSample(IMFSample? returned, IMFSample? own)
+    {
+        if (returned is null || ReferenceEquals(returned, own)) return;
+        if (own is not null && returned.NativePointer == own.NativePointer)
         {
-            buffer.Events?.Dispose();
-            if (buffer.Sample is { } sample && !ReferenceEquals(sample, own)) sample.Dispose();
-            own?.Dispose();
+            returned.NativePointer = IntPtr.Zero;
+            return;
         }
+        returned.Dispose();
     }
 
     private static byte[] CopyBytes(IMFSample sample)
