@@ -8017,6 +8017,18 @@ class ClockSyncTest {
     }
 
     @Test
+    fun invalidRttIsIgnored() {
+        val sync = ClockSync()
+        sync.ping(1_000_000)
+        sync.onRtt(2 * oneWay, 1_000_000 + offset)
+
+        sync.onRtt(-5_000, 1_100_000 + offset)
+        sync.onRtt(0, 1_200_000 + offset)
+
+        assertEquals(offset, sync.offsetUs())
+    }
+
+    @Test
     fun oldSamplesLeaveAfterTwentySecondsSoDriftIsFollowed() {
         val sync = ClockSync()
         sync.ping(1_000_000)
@@ -8571,9 +8583,9 @@ class ConnectionTest {
         val connection = newConnection(idleTimeoutMs = 300)
 
         connection.connect(usb())
-        val state = connection.await { it is ConnectionState.Failed }
+        val state = connection.await { it is ConnectionState.Failed } as ConnectionState.Failed
 
-        assertTrue(state is ConnectionState.Failed)
+        assertTrue(state.reason, state.reason.startsWith("O PC parou de responder"))
         serverSide.await()
     }
 
@@ -8631,9 +8643,11 @@ class ClockSync(private val windowUs: Long = 20_000_000) {
     @Synchronized
     fun onPcPing(pcUs: Long, receivedUs: Long) = add(pings, receivedUs, receivedUs - pcUs)
 
-    /** Um RTT medido pelos PINGs do próprio celular. */
+    /** Um RTT medido pelos PINGs do próprio celular. Zero ou negativo (PONG inválido) é ignorado. */
     @Synchronized
-    fun onRtt(rttUs: Long, atUs: Long) = add(rtts, atUs, rttUs)
+    fun onRtt(rttUs: Long, atUs: Long) {
+        if (rttUs > 0) add(rtts, atUs, rttUs)
+    }
 
     /** Relógio do celular − relógio do PC, em µs; null até ter um PING do PC e um RTT. */
     @Synchronized
@@ -8684,7 +8698,8 @@ Substitua `android/app/src/main/java/dev/screenshare/android/net/Connection.kt` 
 - `idleTimeoutMs` e `sink` entram pelo construtor;
 - o laço de leitura responde PING com PONG, acerta o `ClockSync`, entrega `CONFIG` e `FRAME` e atualiza o estado com o `CONFIG` novo;
 - `requestKeyframe()`;
-- `soTimeout = idleTimeoutMs` depois do `CONFIG`.
+- `soTimeout = idleTimeoutMs` depois do `CONFIG`, com mensagem própria quando o PC fica mudo no meio da sessão;
+- a saída fica pronta antes de publicar `Connected` (quem reage a `Connected` já pode pedir keyframe), e uma conexão antiga que ainda esteja terminando não mexe no relógio nem na saída da nova.
 
 ```kotlin
 package dev.screenshare.android.net
@@ -8799,10 +8814,11 @@ class Connection(
 
     fun connect(target: ConnectTarget) {
         disconnect()
-        clock = ClockSync()
+        // Cada conexão tem o seu relógio: uma conexão antiga que ainda esteja terminando não mexe no da nova.
+        val sync = ClockSync().also { clock = it }
         _state.value = ConnectionState.Connecting
         val s = Socket().also { socket = it } // guardado já aqui para disconnect() poder interromper o connect
-        job = scope.launch(Dispatchers.IO) { run(s, target) }
+        job = scope.launch(Dispatchers.IO) { run(s, target, sync) }
     }
 
     /** Pede ao PC um quadro completo (decoder novo ou com erro). Não bloqueia; sem conexão, não faz nada. */
@@ -8825,7 +8841,8 @@ class Connection(
         _state.value = ConnectionState.Disconnected
     }
 
-    private suspend fun run(raw: Socket, target: ConnectTarget) {
+    private suspend fun run(raw: Socket, target: ConnectTarget, clock: ClockSync) {
+        var connected = false
         try {
             val (host, port) = target.endpoint()
             raw.tcpNoDelay = true
@@ -8872,8 +8889,9 @@ class Connection(
             s.soTimeout = idleTimeoutMs // o PC pinga a cada segundo: mudo por mais que isso é conexão morta
             // disconnect() pode ter corrido com a leitura do CONFIG: não publicar Connected depois de Disconnected
             if (!currentCoroutineContext().isActive) return
+            output = out // antes de Connected: quem reage a Connected já pode pedir keyframe
+            connected = true
             _state.value = ConnectionState.Connected(config, rttMs = null)
-            output = out
             sink.onConfig(config)
             val pinger = scope.launch(Dispatchers.IO) {
                 while (isActive) {
@@ -8910,9 +8928,14 @@ class Connection(
                 }
             } finally {
                 pinger.cancel()
-                output = null
+                if (output === out) output = null // um connect() novo pode já ter posto a saída dele
             }
             fail("Conexão perdida")
+        } catch (e: SocketTimeoutException) {
+            fail(
+                if (connected) "O PC parou de responder (nada chegou em ${idleTimeoutMs / 1_000} s). Confira a rede e conecte de novo."
+                else e.describe(),
+            )
         } catch (e: IOException) { // inclui ProtocolException, EOFException e erros de TLS
             fail(e.describe())
         } catch (e: CancellationException) {
@@ -9042,7 +9065,7 @@ Em `android/app/src/main/java/dev/screenshare/android/net/ConnectionViewModel.kt
 ```
 
 Run: `.\android\gradlew.bat -p android :app:testDebugUnitTest`
-Expected: 90 testes, todos aprovados, exceto as 2 falhas conhecidas do `PairingStoreTest`. Rode 3 vezes: `ConnectionTest` usa sockets de verdade.
+Expected: 91 testes, todos aprovados, exceto as 2 falhas conhecidas do `PairingStoreTest`. Rode 3 vezes: `ConnectionTest` usa sockets de verdade.
 
 - [ ] **Step 4: Commit e push**
 
@@ -9852,7 +9875,7 @@ object CodecSupport {
 ```
 
 Run: `.\android\gradlew.bat -p android :app:testDebugUnitTest`
-Expected: 116 testes, todos aprovados, exceto as 2 falhas conhecidas do `PairingStoreTest` (ver Task 10). São 26 novos: `AnnexBTest` 9, `DecoderCoreTest` 13 e `VideoStatsTest` 4.
+Expected: 117 testes, todos aprovados, exceto as 2 falhas conhecidas do `PairingStoreTest` (ver Task 10). São 26 novos: `AnnexBTest` 9, `DecoderCoreTest` 13 e `VideoStatsTest` 4.
 
 - [ ] **Step 3: Commit e push**
 
@@ -10374,7 +10397,7 @@ Em `android/app/src/main/java/dev/screenshare/android/ui/ScreenShareApp.kt`:
 - [ ] **Step 3: Compilar e testar**
 
 Run: `.\android\gradlew.bat -p android :app:assembleDebug :app:testDebugUnitTest --continue`
-Expected: o APK compila sem avisos novos do Kotlin (linhas `w:`). São 116 testes, todos aprovados, exceto as 2 falhas conhecidas do `PairingStoreTest`.
+Expected: o APK compila sem avisos novos do Kotlin (linhas `w:`). São 117 testes, todos aprovados, exceto as 2 falhas conhecidas do `PairingStoreTest`.
 
 - [ ] **Step 4: Commit e push**
 
@@ -10871,7 +10894,7 @@ Mantenha o tom e o formato do README atual (pt-BR, emojis nos títulos que já e
 Em `docs/guia-do-codigo.md`:
 - uma seção para o projeto `host/ScreenShare.Video`, com uma linha por arquivo de `Pipeline/` e de `Hardware/` dizendo o que faz;
 - as linhas dos arquivos novos e alterados do Core (`Video/AnnexB.cs`, `Video/PcClock.cs`, `Protocol/VideoSendQueue.cs`, `Protocol/SessionWriter.cs`), do DevHost (`DevHostOptions.cs`, `VideoStatsLine.cs`, `HostServer.cs`) e do app (`video/*.kt`, `net/Connection.kt`, `ui/ImmersiveScreen.kt`);
-- as contagens de testes: 361 aprovados e 9 ignorados no host sem GPU, 369 e 1 com GPU, e 116 no app.
+- as contagens de testes: 361 aprovados e 9 ignorados no host sem GPU, 369 e 1 com GPU, e 117 no app.
 
 Siga o formato de tabela "Arquivo | O que faz" que o guia já usa.
 
