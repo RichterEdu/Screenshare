@@ -53,6 +53,9 @@ class VideoStatsTest {
 
         assertEquals("c2.qti.avc.decoder.low_latency", CodecSupport.choose(decoders, VideoCodec.H264, 2520, 1080)?.name)
         assertEquals(VideoCodec.H264, CodecSupport.supported(decoders, 2520, 1080))
-        assertEquals(VideoCodec.ALL, CodecSupport.supported(decoders, 1920, 1080))
+        // H.265 só em software não entra no HELLO quando há decoder de hardware: o PC escolheria H.265
+        assertEquals(VideoCodec.H264, CodecSupport.supported(decoders, 1920, 1080))
+        // sem nenhum decoder de hardware, vale o software
+        assertEquals(VideoCodec.H265, CodecSupport.supported(decoders.filter { !it.hardware }, 1920, 1080))
     }
 }

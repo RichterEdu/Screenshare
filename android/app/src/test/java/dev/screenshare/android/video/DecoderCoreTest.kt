@@ -154,6 +154,46 @@ class DecoderCoreTest {
     }
 
     @Test
+    fun requestBlockedByTheLimitIsSentByALaterTick() {
+        val core = running()
+        core.onFrame(p(1)) // pede (t = 0)
+        now = 100
+        core.onFrame(p(2)) // barrado pelo limite; a tela do PC para e não vem mais nada
+        assertEquals(1, keyframeRequests)
+
+        now = 300
+        core.onTick()
+        assertEquals(1, keyframeRequests)
+        now = 600
+        core.onTick()
+        assertEquals(2, keyframeRequests)
+        now = 1_200
+        core.onTick()
+        assertEquals(2, keyframeRequests) // o pedido guardado sai uma vez só
+    }
+
+    @Test
+    fun configThatOnlyChangesTheBitrateKeepsTheDecoder() {
+        val core = running()
+
+        core.onConfig(config.copy(bitrateKbps = 25_000))
+
+        assertEquals(1, port.started.size)
+        assertEquals(0, port.releases)
+    }
+
+    @Test
+    fun keyframeThatArrivesBeforeTheSurfaceStartsTheDecoderWhenItAppears() {
+        core.onConfig(config.copy(codecConfig = ByteArray(0)))
+        core.onFrame(key(1)) // sem superfície ainda
+
+        core.onSurface(true)
+
+        assertEquals(1, port.started.size)
+        assertEquals(1, keyframeRequests)
+    }
+
+    @Test
     fun lostSurfaceReleasesAndItsReturnRecreatesAndAsksForAKeyframe() {
         val core = running()
 

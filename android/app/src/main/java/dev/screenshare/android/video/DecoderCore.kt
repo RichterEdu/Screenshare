@@ -28,7 +28,9 @@ interface CodecPort {
  * - superfície perdida: solta o decoder; de volta: cria e pede keyframe;
  * - erro do decoder: recria e pede keyframe;
  * - callbacks de um decoder antigo (geração anterior) são ignorados;
- * - no máximo um pedido de keyframe a cada [KEYFRAME_REQUEST_INTERVAL_MS].
+ * - no máximo um pedido de keyframe a cada [KEYFRAME_REQUEST_INTERVAL_MS]; um pedido barrado pelo limite fica guardado e
+ *   sai no [onTick] seguinte depois do intervalo (com a tela do PC parada, não viria outro quadro para pedir de novo);
+ * - CONFIG que só muda o bitrate mantém o decoder.
  */
 class DecoderCore(
     private val port: CodecPort,
@@ -41,6 +43,7 @@ class DecoderCore(
     private var running = false
     private var awaitingKeyframe = true
     private var lastRequestMs: Long? = null
+    private var pendingRequest = false
     private val waiting = ArrayDeque<FrameMessage>()
     private val inputs = ArrayDeque<Pair<Int, Int>>() // (índice, capacidade)
 
@@ -51,8 +54,9 @@ class DecoderCore(
     val isRunning: Boolean get() = running
 
     fun onConfig(config: ConfigMessage) {
-        if (config == this.config) return
+        val current = this.config
         this.config = config
+        if (current != null && sameStream(current, config)) return // só o bitrate mudou: o decoder serve
         csd = if (config.codecConfig.isEmpty()) null else CsdBuilder.build(config.codec, config.codecConfig)
         stop()
         startIfReady(askKeyframe = false) // o PC manda o IDR logo depois do CONFIG
@@ -60,7 +64,7 @@ class DecoderCore(
 
     fun onFrame(frame: FrameMessage) {
         val config = config ?: return
-        if (!running && hasSurface && csd == null && frame.isKeyframe) {
+        if (!running && csd == null && frame.isKeyframe) {
             csd = CsdBuilder.build(config.codec, frame.data) // CONFIG sem parâmetros: eles vêm no keyframe
             startIfReady(askKeyframe = false)
         }
@@ -70,6 +74,7 @@ class DecoderCore(
             return
         }
         awaitingKeyframe = false
+        pendingRequest = false
         if (frame.isKeyframe) waiting.clear() // o keyframe torna inúteis os quadros que ainda esperavam
         waiting.addLast(frame)
         if (waiting.size > MAX_WAITING) {
@@ -81,7 +86,17 @@ class DecoderCore(
 
     fun onSurface(available: Boolean) {
         hasSurface = available
-        if (available) startIfReady(askKeyframe = true) else stop()
+        if (!available) {
+            stop()
+            return
+        }
+        if (config != null && csd == null) askKeyframe() // sem parâmetros ainda: só um keyframe destrava o decoder
+        startIfReady(askKeyframe = true)
+    }
+
+    /** Chamado periodicamente (o player chama a cada 100 ms): manda o pedido de keyframe que o limite tinha barrado. */
+    fun onTick() {
+        if (pendingRequest) askKeyframe()
     }
 
     fun onInputAvailable(generation: Int, index: Int, capacity: Int) {
@@ -108,6 +123,7 @@ class DecoderCore(
         stop()
         config = null
         csd = null
+        pendingRequest = false
     }
 
     private fun feed() {
@@ -154,10 +170,18 @@ class DecoderCore(
     private fun askKeyframe() {
         val now = nowMs()
         val last = lastRequestMs
-        if (last != null && now - last < KEYFRAME_REQUEST_INTERVAL_MS) return
+        if (last != null && now - last < KEYFRAME_REQUEST_INTERVAL_MS) {
+            pendingRequest = true // adiado, não perdido
+            return
+        }
         lastRequestMs = now
+        pendingRequest = false
         requestKeyframe()
     }
+
+    /** O mesmo stream para o decoder: o bitrate não importa para ele. */
+    private fun sameStream(a: ConfigMessage, b: ConfigMessage) =
+        a.codec == b.codec && a.width == b.width && a.height == b.height && a.codecConfig.contentEquals(b.codecConfig)
 
     companion object {
         const val MAX_WAITING = 3

@@ -32,8 +32,16 @@ object CodecSupport {
             ?: candidates.firstOrNull()
     }
 
-    /** Os codecs (flags do HELLO) que algum decoder abre no tamanho da tela. */
+    /**
+     * Os codecs (flags do HELLO) que o celular decodifica no tamanho da tela. Se houver decoder de hardware para algum
+     * codec, só os de hardware entram: o PC prefere H.265, e um H.265 só em software não aguenta 60 fps na tela inteira.
+     */
     fun supported(decoders: List<DecoderInfo>, width: Int, height: Int): Int {
+        val hardware = flags(decoders.filter { it.hardware }, width, height)
+        return if (hardware != 0) hardware else flags(decoders, width, height)
+    }
+
+    private fun flags(decoders: List<DecoderInfo>, width: Int, height: Int): Int {
         var codecs = 0
         if (choose(decoders, VideoCodec.H264, width, height) != null) codecs = codecs or VideoCodec.H264
         if (choose(decoders, VideoCodec.H265, width, height) != null) codecs = codecs or VideoCodec.H265
