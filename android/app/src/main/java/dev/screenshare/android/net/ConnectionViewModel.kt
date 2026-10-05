@@ -9,10 +9,15 @@ import androidx.lifecycle.viewModelScope
 import dev.screenshare.android.pairing.PairingUri
 import dev.screenshare.android.pairing.deviceNameOf
 import dev.screenshare.android.protocol.DeniedReason
+import dev.screenshare.android.protocol.VideoCodec
 import dev.screenshare.android.security.KeystoreTokenCipher
 import dev.screenshare.android.security.PairedPc
 import dev.screenshare.android.security.PairingStore
 import dev.screenshare.android.security.pairingDataStore
+import dev.screenshare.android.video.CodecSupport
+import dev.screenshare.android.video.DecoderInfo
+import dev.screenshare.android.video.MediaCodecDecoders
+import dev.screenshare.android.video.VideoPlayer
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -35,8 +40,24 @@ class ConnectionViewModel(application: Application) : AndroidViewModel(applicati
     /** Aviso para o usuário fora do estado da conexão (QR inválido, leitor indisponível…). */
     val message: StateFlow<String?> = _message.asStateFlow()
 
-    private val connection = Connection(
-        viewModelScope, screen = { landscapeScreenInfo(application) },
+    /** Os decoders do aparelho (lidos uma vez): escolhem o decoder e os codecs do HELLO. */
+    private val decoders: List<DecoderInfo> by lazy { MediaCodecDecoders.list() }
+
+    /** O vídeo da conexão; a tela imersiva liga a superfície dela a ele. */
+    val player: VideoPlayer = VideoPlayer(
+        decoders = { decoders },
+        clock = { connection.clock },
+        requestKeyframe = { connection.requestKeyframe() },
+    )
+
+    private val connection: Connection = Connection(
+        viewModelScope,
+        screen = {
+            val screen = landscapeScreenInfo(application)
+            // Sem decoder que abra esse tamanho (raro): manda os dois e deixa o PC decidir, como antes.
+            screen.copy(codecs = CodecSupport.supported(decoders, screen.width, screen.height).takeIf { it != 0 } ?: VideoCodec.ALL)
+        },
+        sink = player,
         // Roda na thread de IO dentro da conexão: não pode lançar (derrubaria o app), então só muda estado e dispara o salvamento.
         onPaired = { pc ->
             persist("Não foi possível salvar o pareamento") { store.save(pc) }
@@ -70,6 +91,7 @@ class ConnectionViewModel(application: Application) : AndroidViewModel(applicati
             return
         }
         _message.value = null
+        player.reset()
         connection.connect(ConnectTarget.Pairing(info, deviceNameOf(Build.MODEL), overUsb))
     }
 
@@ -84,6 +106,7 @@ class ConnectionViewModel(application: Application) : AndroidViewModel(applicati
             return
         }
         _message.value = null
+        player.reset()
         connection.connect(ConnectTarget.Wifi(address, pc))
         persist("Não foi possível salvar o último endereço") { store.updateLastHost(address.host) }
     }
@@ -95,6 +118,7 @@ class ConnectionViewModel(application: Application) : AndroidViewModel(applicati
             return
         }
         _message.value = null
+        player.reset()
         connection.connect(ConnectTarget.Usb(pc))
     }
 
@@ -105,7 +129,10 @@ class ConnectionViewModel(application: Application) : AndroidViewModel(applicati
 
     fun disconnect() = connection.disconnect()
 
-    override fun onCleared() = connection.disconnect()
+    override fun onCleared() {
+        connection.disconnect()
+        player.release()
+    }
 
     /**
      * Roda uma gravação do [store] sem deixar a falha escapar: o viewModelScope não tem handler e uma exceção

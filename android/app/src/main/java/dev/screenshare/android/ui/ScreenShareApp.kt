@@ -18,7 +18,7 @@ fun ScreenShareApp(viewModel: ConnectionViewModel) {
     val context = LocalContext.current
 
     when (val current = state) {
-        is ConnectionState.Connected -> ImmersiveScreen(current, onDisconnect = viewModel::disconnect)
+        is ConnectionState.Connected -> ImmersiveScreen(current, viewModel.player, onDisconnect = viewModel::disconnect)
         else -> {
             val hosts by viewModel.hosts.collectAsState()
             val pairedPc by viewModel.pairedPc.collectAsState()
