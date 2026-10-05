@@ -7287,7 +7287,7 @@ Com esta task o PC já manda vídeo de verdade. O app ainda ignora os quadros (a
   - `DevHostOptions.Parse(IReadOnlyList<string>) → DevHostOptions(bool NoMonitor, bool NoVideo, bool CapturePrimary, string? RecordPath, VideoOptions Video)`, que lança `OptionsException` com a mensagem para o usuário;
   - `DevHostOptions.Usage`;
   - `VideoStatsLine.Format(VideoStats previous, VideoStats current, TimeSpan elapsed, int drops, double? rttMs) → string`;
-  - `MonitorOverrideVideoSource(IVideoSource inner, Func<IMonitorSource> monitor)` e `RecordingVideoSource(IVideoSource inner, string path, Action<string> log)`;
+  - `MonitorOverrideVideoSource(IVideoSource inner, Func<IMonitorSource> monitor)` e `RecordingVideoSource(IVideoSource inner, string path, Action<string> log)` (o arquivo fecha em qualquer saída, inclusive quando o vídeo falha ao abrir: a próxima sessão grava nele de novo);
   - no `HostServer`, o parâmetro novo `TimeSpan? statsInterval = null` (padrão 5 s).
 
 - [ ] **Step 1: Testes**
@@ -7351,6 +7351,7 @@ public sealed class DevHostOptionsTests
     public void Option_without_its_value_is_rejected()
     {
         Assert.Throws<OptionsException>(() => DevHostOptions.Parse(["--gravar"]));
+        Assert.Throws<OptionsException>(() => DevHostOptions.Parse(["--gravar", "--fps", "30"]));
     }
 
     [Fact]
@@ -7422,6 +7423,24 @@ public sealed class VideoSourceDecoratorsTests : IDisposable
 
         Assert.Equal(new byte[] { 0, 0, 0, 1, 0x26, 0, 0, 0, 1, 0x02 }, File.ReadAllBytes(path));
         Assert.Equal(3, output.Sent.Count);
+    }
+
+    [Fact]
+    public async Task Recording_file_is_closed_when_the_video_fails_to_start()
+    {
+        var path = Path.Combine(_dir, "video.h265");
+        var source = new RecordingVideoSource(new FailingSource(), path, _ => { });
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            source.StartAsync(Request(), new FakeOutput(), CancellationToken.None));
+
+        File.Delete(path); // aberto ainda, isto falharia no Windows
+    }
+
+    private sealed class FailingSource : IVideoSource
+    {
+        public Task<IVideoStream?> StartAsync(VideoRequest request, IVideoOutput output, CancellationToken cancellationToken) =>
+            throw new InvalidOperationException("falha falsa ao abrir");
     }
 
     private sealed class CapturingSource : IVideoSource
@@ -7519,7 +7538,8 @@ public sealed record DevHostOptions(bool NoMonitor, bool NoVideo, bool CapturePr
 
     private static string Value(IReadOnlyList<string> args, ref int i, string option)
     {
-        if (i + 1 >= args.Count) throw new OptionsException($"{option} precisa de um valor.");
+        if (i + 1 >= args.Count || args[i + 1].StartsWith("--", StringComparison.Ordinal))
+            throw new OptionsException($"{option} precisa de um valor.");
         return args[++i];
     }
 
@@ -7591,7 +7611,16 @@ public sealed class RecordingVideoSource(IVideoSource inner, string path, Action
     public async Task<IVideoStream?> StartAsync(VideoRequest request, IVideoOutput output, CancellationToken cancellationToken)
     {
         var recorder = new RecordingOutput(output, path, log);
-        var stream = await inner.StartAsync(request, recorder, cancellationToken);
+        IVideoStream? stream;
+        try
+        {
+            stream = await inner.StartAsync(request, recorder, cancellationToken);
+        }
+        catch
+        {
+            recorder.Close(); // o arquivo não pode ficar aberto: a próxima sessão grava nele de novo
+            throw;
+        }
         if (stream is null)
         {
             recorder.Close();
@@ -7618,7 +7647,7 @@ public sealed class RecordingVideoSource(IVideoSource inner, string path, Action
                 {
                     _file?.Write(frame.Data);
                 }
-                catch (IOException e)
+                catch (Exception e) when (e is IOException or UnauthorizedAccessException)
                 {
                     log($"Gravação interrompida: {e.Message}");
                     _file?.Dispose();
@@ -7646,15 +7675,21 @@ public sealed class RecordingVideoSource(IVideoSource inner, string path, Action
 
         public async ValueTask DisposeAsync()
         {
-            await inner.DisposeAsync();
-            recorder.Close();
+            try
+            {
+                await inner.DisposeAsync();
+            }
+            finally
+            {
+                recorder.Close();
+            }
         }
     }
 }
 ```
 
 Run: `dotnet test host/ScreenShare.slnx --filter "FullyQualifiedName~DevHostOptionsTests|FullyQualifiedName~VideoSourceDecoratorsTests"`
-Expected: PASS (13 + 2).
+Expected: PASS (13 + 3).
 
 - [ ] **Step 3: Estatísticas no `HostServer`**
 
@@ -7894,7 +7929,7 @@ Em `host/ScreenShare.DevHost/Program.cs`:
 - [ ] **Step 5: Rodar tudo, commit e push**
 
 Run: `dotnet build host/ScreenShare.slnx` e `dotnet test host/ScreenShare.slnx`
-Expected: 0 avisos; 355 aprovados e 9 ignorados.
+Expected: 0 avisos; 356 aprovados e 9 ignorados.
 
 ```bash
 git add host/ScreenShare.DevHost host/ScreenShare.Video host/ScreenShare.Tests
@@ -10764,12 +10799,12 @@ internal sealed class DesktopDuplicationCapture : IScreenCapture
 ```
 
 Run (PowerShell, no PC do usuário): `$env:SCREENSHARE_GPU_TESTS=1; dotnet test host/ScreenShare.slnx; Remove-Item Env:SCREENSHARE_GPU_TESTS`
-Expected: 368 aprovados e 1 ignorado (o teste do driver de monitor virtual).
+Expected: 369 aprovados e 1 ignorado (o teste do driver de monitor virtual).
 
 - [ ] **Step 4: Rodar tudo, commit e push**
 
 Run: `dotnet build host/ScreenShare.slnx` e `dotnet test host/ScreenShare.slnx`
-Expected: 0 avisos; 360 aprovados e 9 ignorados.
+Expected: 0 avisos; 361 aprovados e 9 ignorados.
 
 ```bash
 git add host/ScreenShare.Video host/ScreenShare.Tests/Video
@@ -10836,7 +10871,7 @@ Mantenha o tom e o formato do README atual (pt-BR, emojis nos títulos que já e
 Em `docs/guia-do-codigo.md`:
 - uma seção para o projeto `host/ScreenShare.Video`, com uma linha por arquivo de `Pipeline/` e de `Hardware/` dizendo o que faz;
 - as linhas dos arquivos novos e alterados do Core (`Video/AnnexB.cs`, `Video/PcClock.cs`, `Protocol/VideoSendQueue.cs`, `Protocol/SessionWriter.cs`), do DevHost (`DevHostOptions.cs`, `VideoStatsLine.cs`, `HostServer.cs`) e do app (`video/*.kt`, `net/Connection.kt`, `ui/ImmersiveScreen.kt`);
-- as contagens de testes: 360 aprovados e 9 ignorados no host sem GPU, 368 e 1 com GPU, e 116 no app.
+- as contagens de testes: 361 aprovados e 9 ignorados no host sem GPU, 369 e 1 com GPU, e 116 no app.
 
 Siga o formato de tabela "Arquivo | O que faz" que o guia já usa.
 
